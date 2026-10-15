@@ -109,6 +109,7 @@ cd backend
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m uvicorn app.main:app --reload --port 8010
+.venv/Scripts/python -m uvicorn app.main:app --reload --port 8010
 # 后端: http://localhost:8010   健康检查: /health   LLM 自检: /api/llm/ping
 ```
 

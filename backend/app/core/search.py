@@ -1,11 +1,9 @@
-"""通用搜索采集（第 16 章）。
+"""Search providers used by the research pipeline.
 
-- 主用博查 Bocha Web Search API（有 key 时），对中文/国内站点友好。
-  Endpoint: POST https://api.bocha.cn/v1/web-search
-- multi_search：一次跑多条查询并按 URL 去重，用于深度调研多角度检索。
-- 相关性过滤：剔除标题/摘要完全不含关键词的结果（避免题不对版）。
-- 尽力而为：单条查询失败不抛断，返回已得结果。
+Both providers return the same normalized shape:
+title, url, snippet, source, captured_at.
 """
+
 from __future__ import annotations
 
 import datetime as _dt
@@ -16,13 +14,26 @@ import httpx
 
 from app.core.config import get_settings
 
-# 博查异常码 → 人话提示
 _BOCHA_ERR = {
-    400: "请求参数错误（如缺少 query）",
-    401: "博查 API Key 无效或缺失",
-    403: "博查账户余额不足，请充值",
-    429: "博查请求频率超限，请稍后重试",
-    500: "博查搜索服务内部异常",
+    400: "Bocha request parameters are invalid.",
+    401: "Bocha API key is invalid or missing.",
+    403: "Bocha account balance is insufficient.",
+    429: "Bocha request rate limit exceeded.",
+    500: "Bocha search service error.",
+}
+
+_SERPAPI_ERR = {
+    400: "SerpAPI request parameters are invalid.",
+    401: "SerpAPI API key is invalid or missing.",
+    403: "SerpAPI account access is forbidden or exhausted.",
+    429: "SerpAPI request rate limit exceeded.",
+}
+
+_FRESHNESS_TBS = {
+    "oneDay": "qdr:d",
+    "oneWeek": "qdr:w",
+    "oneMonth": "qdr:m",
+    "oneYear": "qdr:y",
 }
 
 
@@ -31,41 +42,41 @@ def _now() -> str:
 
 
 def _is_relevant(query: str, title: str, snippet: str) -> bool:
-    """简易相关性过滤：检查搜索 query 的核心词是否出现在标题或摘要中。
-
-    避免搜 "Notion 功能对比" 返回汽水音乐之类完全不相关的结果。
-    提取 query 中的英文品牌词/中文关键词做匹配。
-    """
+    """Light relevance filter to drop obvious off-topic search results."""
     if not query:
         return True
     text = f"{title} {snippet}".lower()
     q = query.lower()
 
-    # 提取英文单词（品牌名等），3 个字符以上的都要在结果中出现至少一个
     english_words = re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{2,}", q)
-    # 提取中文关键词（2 个字以上的中文字符串）
     chinese_words = re.findall(r"[\u4e00-\u9fa5]{2,}", q)
 
     must_match = []
-    # 英文品牌词（第一个英文词通常是品牌名，必须匹配）
     if english_words:
         must_match.append(english_words[0])
-    # 中文第一个名词短语也尽量匹配
     if chinese_words:
         must_match.append(chinese_words[0])
 
     if not must_match:
         return True
 
-    # 至少要有一个核心词命中（英文不区分大小写）
     for kw in must_match:
         if kw.lower() in text:
             return True
 
-    # 宽松二次校验：只要有任意 2 个查询词命中即可
     all_kw = english_words + chinese_words
     hits = sum(1 for kw in all_kw if kw.lower() in text)
     return hits >= 2
+
+
+def _site_query(query: str, site: Optional[str]) -> str:
+    if not site:
+        return query
+    domains = [s.strip() for s in site.split("|") if s.strip()]
+    if not domains:
+        return query
+    site_expr = " OR ".join(f"site:{d}" for d in domains)
+    return f"({site_expr}) {query}"
 
 
 def search_bocha(
@@ -75,20 +86,12 @@ def search_bocha(
     site: Optional[str] = None,
     freshness: str = "noLimit",
 ) -> list[dict]:
-    """用博查 Bocha Web Search 做网页搜索。
-
-    - `site`: 可选，形如 "douyin.com" / "zhihu.com"，映射到博查 include 限定域名。
-    - `freshness`: 时效性过滤（noLimit/oneDay/oneWeek/oneMonth/oneYear），聚焦最新数据。
-    - 返回的每条都带 title + url + snippet + source + captured_at，便于后续抓取正文。
-    - 自动做相关性过滤，剔除明显不相关的结果。
-    """
+    """Search web pages with Bocha Web Search."""
     settings = get_settings()
     if not settings.bocha_api_key:
-        raise RuntimeError("未配置 BOCHA_API_KEY，搜索暂不可用")
+        raise RuntimeError("BOCHA_API_KEY is not configured.")
 
-    # count 取值范围 1-50
     count = max(1, min(int(num), 50))
-    # 多取一些以预留过滤余量（相关性过滤会淘汰一部分）
     fetch_count = min(count * 2, 50)
     payload = {
         "query": query,
@@ -97,7 +100,6 @@ def search_bocha(
         "count": fetch_count,
     }
     if site:
-        # 博查用 include 限定网站范围（多个用 | 分隔）
         payload["include"] = site
 
     endpoint = f"{settings.bocha_base_url.rstrip('/')}/web-search"
@@ -112,14 +114,17 @@ def search_bocha(
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
         r = client.post(endpoint, headers=headers, json=payload)
         if r.status_code != 200:
-            msg = _BOCHA_ERR.get(r.status_code, f"博查接口返回 HTTP {r.status_code}")
+            msg = _BOCHA_ERR.get(
+                r.status_code, f"Bocha returned HTTP {r.status_code}."
+            )
             raise RuntimeError(msg)
         body = r.json()
 
-    # 博查在 HTTP 200 时仍可能在 body 内返回错误码
     code = body.get("code")
     if code is not None and int(code) != 200:
-        msg = _BOCHA_ERR.get(int(code), body.get("msg") or f"博查返回业务码 {code}")
+        msg = _BOCHA_ERR.get(
+            int(code), body.get("msg") or f"Bocha returned business code {code}."
+        )
         raise RuntimeError(msg)
 
     data = body.get("data") or {}
@@ -132,10 +137,8 @@ def search_bocha(
         url = item.get("url", "")
         if not url:
             continue
-        # summary（完整摘要，已开启）优先，缺失时退回 snippet
         snippet = (item.get("summary") or item.get("snippet") or "").strip()
         title = (item.get("name") or "").strip()
-        # 相关性过滤：剔除明显不相关的结果（题不对版）
         if not _is_relevant(query, title, snippet):
             continue
         results.append(
@@ -144,7 +147,6 @@ def search_bocha(
                 "url": url,
                 "snippet": snippet,
                 "source": item.get("siteName") or item.get("displayUrl", ""),
-                # 标准发布时间用 datePublished（dateLastCrawled 有 UTC+8 坑，不用）
                 "captured_at": item.get("datePublished") or _now(),
             }
         )
@@ -153,10 +155,95 @@ def search_bocha(
     return results
 
 
-def search(query: str, *, num: int = 10, site: Optional[str] = None,
-           freshness: str = "noLimit") -> list[dict]:
-    """对外入口：博查搜索。失败抛给上层处理。"""
-    return search_bocha(query, num=num, site=site, freshness=freshness)
+def search_serpapi(
+    query: str,
+    *,
+    num: int = 10,
+    site: Optional[str] = None,
+    freshness: str = "noLimit",
+) -> list[dict]:
+    """Search Google results through SerpAPI."""
+    settings = get_settings()
+    if not settings.serpapi_key:
+        raise RuntimeError("SERPAPI_KEY is not configured.")
+
+    count = max(1, min(int(num), 100))
+    fetch_count = min(count * 2, 100)
+    params = {
+        "engine": "google",
+        "q": _site_query(query, site),
+        "api_key": settings.serpapi_key,
+        "num": fetch_count,
+        "hl": "zh-cn",
+    }
+    tbs = _FRESHNESS_TBS.get(freshness or "")
+    if tbs:
+        params["tbs"] = tbs
+
+    timeout = httpx.Timeout(
+        connect=8, read=settings.search_timeout, write=5, pool=5
+    )
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        r = client.get(settings.serpapi_base_url, params=params)
+        if r.status_code != 200:
+            msg = _SERPAPI_ERR.get(
+                r.status_code, f"SerpAPI returned HTTP {r.status_code}."
+            )
+            raise RuntimeError(msg)
+        body = r.json()
+
+    if body.get("error"):
+        raise RuntimeError(f"SerpAPI error: {body['error']}")
+
+    results: list[dict] = []
+    for item in body.get("organic_results") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("link", "")
+        if not url:
+            continue
+        title = (item.get("title") or "").strip()
+        snippet = (
+            item.get("snippet")
+            or item.get("snippet_highlighted_words")
+            or item.get("rich_snippet", {})
+            or ""
+        )
+        if isinstance(snippet, list):
+            snippet = " ".join(str(x) for x in snippet)
+        elif isinstance(snippet, dict):
+            snippet = " ".join(str(x) for x in snippet.values())
+        snippet = str(snippet).strip()
+        if not _is_relevant(query, title, snippet):
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "source": item.get("source") or item.get("displayed_link", ""),
+                "captured_at": item.get("date") or _now(),
+            }
+        )
+        if len(results) >= count:
+            break
+    return results
+
+
+def search(
+    query: str,
+    *,
+    num: int = 10,
+    site: Optional[str] = None,
+    freshness: str = "noLimit",
+) -> list[dict]:
+    """Search entry point selected by SEARCH_PROVIDER."""
+    provider = (get_settings().search_provider or "bocha").strip().lower()
+    if provider in {"serpapi", "serp", "google"}:
+        return search_serpapi(query, num=num, site=site, freshness=freshness)
+    if provider == "bocha":
+        return search_bocha(query, num=num, site=site, freshness=freshness)
+    raise RuntimeError(f"Unsupported SEARCH_PROVIDER: {provider}")
 
 
 def multi_search(
@@ -166,7 +253,7 @@ def multi_search(
     site: Optional[str] = None,
     freshness: str = "noLimit",
 ) -> list[dict]:
-    """跑多条查询，按 URL 去重聚合。单条失败跳过（尽力而为）。"""
+    """Run several queries and deduplicate by URL. Failed queries are skipped."""
     seen: set[str] = set()
     out: list[dict] = []
     for q in queries:
