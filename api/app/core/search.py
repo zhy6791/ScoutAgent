@@ -153,9 +153,47 @@ def search_bocha(
     return results
 
 
+def search_serper(query: str, *, num: int = 10, site: Optional[str] = None,
+                  freshness: str = "noLimit") -> list[dict]:
+    settings = get_settings()
+    if not settings.serper_api_key:
+        raise RuntimeError("SERPER_API_KEY is not configured.")
+    count = max(1, min(int(num), 100))
+    domains = [s.strip() for s in (site or "").split("|") if s.strip()]
+    q = f"({' OR '.join(f'site:{d}' for d in domains)}) {query}" if domains else query
+    payload = {"q": q, "num": min(count * 2, 100), "hl": "zh-cn", "gl": "cn"}
+    tbs = {"oneDay": "qdr:d", "oneWeek": "qdr:w", "oneMonth": "qdr:m", "oneYear": "qdr:y"}.get(freshness or "")
+    if tbs:
+        payload["tbs"] = tbs
+    headers = {"X-API-KEY": settings.serper_api_key, "Content-Type": "application/json"}
+    timeout = httpx.Timeout(connect=8, read=settings.search_timeout, write=5, pool=5)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        r = client.post(settings.serper_base_url, headers=headers, json=payload)
+        if r.status_code != 200:
+            raise RuntimeError(f"Serper returned HTTP {r.status_code}.")
+        body = r.json()
+    if body.get("message") and not body.get("organic"):
+        raise RuntimeError(f"Serper error: {body['message']}")
+    results: list[dict] = []
+    for item in body.get("organic") or []:
+        if not isinstance(item, dict) or not item.get("link"):
+            continue
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        if not _is_relevant(query, title, snippet):
+            continue
+        results.append({"title": title, "url": item["link"], "snippet": snippet, "source": item.get("source") or item.get("displayedLink", ""), "captured_at": item.get("date") or _now()})
+        if len(results) >= count:
+            break
+    return results
+
+
 def search(query: str, *, num: int = 10, site: Optional[str] = None,
            freshness: str = "noLimit") -> list[dict]:
     """对外入口：博查搜索。失败抛给上层处理。"""
+    provider = (get_settings().search_provider or "bocha").strip().lower()
+    if provider == "serper":
+        return search_serper(query, num=num, site=site, freshness=freshness)
     return search_bocha(query, num=num, site=site, freshness=freshness)
 
 

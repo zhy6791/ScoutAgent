@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     bocha_base_url: str = "https://api.bocha.cn/v1"
     serpapi_key: str = ""
     serpapi_base_url: str = "https://serpapi.com/search"
+    serper_api_key: str = ""
+    serper_base_url: str = "https://google.serper.dev/search"
     search_timeout: float = 30.0
     bing_search_key: str = ""
 

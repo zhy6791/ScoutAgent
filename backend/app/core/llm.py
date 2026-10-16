@@ -55,9 +55,18 @@ def _get_client() -> OpenAI:
 
 
 def _supports_thinking(model: str) -> bool:
-    """判断模型是否支持思考模式开关（glm-5 系列、glm-4.6 支持 thinking 参数）。"""
+    """判断模型是否支持 thinking 参数。
+
+    DeepSeek 模型也通过当前 OpenAI 兼容网关接收该参数；关闭后可避免
+    推理内容耗尽 max_tokens，导致 JSON 正文为空。
+    """
     m = model.lower()
-    return "glm-5" in m or "glm-4.6" in m or "glm-4-6" in m
+    return (
+        "glm-5" in m
+        or "glm-4.6" in m
+        or "glm-4-6" in m
+        or "deepseek" in m
+    )
 
 
 def _strip_think(text: str) -> str:

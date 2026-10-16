@@ -29,6 +29,13 @@ _SERPAPI_ERR = {
     429: "SerpAPI request rate limit exceeded.",
 }
 
+_SERPER_ERR = {
+    400: "Serper request parameters are invalid.",
+    401: "Serper API key is invalid or missing.",
+    403: "Serper account access is forbidden or credits are exhausted.",
+    429: "Serper request rate limit or credit limit was exceeded.",
+}
+
 _FRESHNESS_TBS = {
     "oneDay": "qdr:d",
     "oneWeek": "qdr:w",
@@ -230,6 +237,74 @@ def search_serpapi(
     return results
 
 
+def search_serper(
+    query: str,
+    *,
+    num: int = 10,
+    site: Optional[str] = None,
+    freshness: str = "noLimit",
+) -> list[dict]:
+    """Search Google results through Serper.dev."""
+    settings = get_settings()
+    if not settings.serper_api_key:
+        raise RuntimeError("SERPER_API_KEY is not configured.")
+
+    count = max(1, min(int(num), 100))
+    fetch_count = min(count * 2, 100)
+    payload = {
+        "q": _site_query(query, site),
+        "num": fetch_count,
+        "hl": "zh-cn",
+        "gl": "cn",
+    }
+    tbs = _FRESHNESS_TBS.get(freshness or "")
+    if tbs:
+        payload["tbs"] = tbs
+
+    headers = {
+        "X-API-KEY": settings.serper_api_key,
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(
+        connect=8, read=settings.search_timeout, write=5, pool=5
+    )
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        r = client.post(settings.serper_base_url, headers=headers, json=payload)
+        if r.status_code != 200:
+            msg = _SERPER_ERR.get(
+                r.status_code, f"Serper returned HTTP {r.status_code}."
+            )
+            raise RuntimeError(msg)
+        body = r.json()
+
+    if body.get("message") and not body.get("organic"):
+        raise RuntimeError(f"Serper error: {body['message']}")
+
+    results: list[dict] = []
+    for item in body.get("organic") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("link", "")
+        if not url:
+            continue
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        if not _is_relevant(query, title, snippet):
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "source": item.get("source") or item.get("displayedLink", ""),
+                "captured_at": item.get("date") or _now(),
+            }
+        )
+        if len(results) >= count:
+            break
+    return results
+
+
 def search(
     query: str,
     *,
@@ -239,6 +314,8 @@ def search(
 ) -> list[dict]:
     """Search entry point selected by SEARCH_PROVIDER."""
     provider = (get_settings().search_provider or "bocha").strip().lower()
+    if provider == "serper":
+        return search_serper(query, num=num, site=site, freshness=freshness)
     if provider in {"serpapi", "serp", "google"}:
         return search_serpapi(query, num=num, site=site, freshness=freshness)
     if provider == "bocha":

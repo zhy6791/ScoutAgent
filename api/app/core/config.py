@@ -39,10 +39,14 @@ class Settings(BaseSettings):
     # 搜索 API（博查 Bocha Web Search：https://open.bocha.cn 获取 key）
     bocha_api_key: str = ""
     bocha_base_url: str = "https://api.bocha.cn/v1"
+    search_provider: str = "bocha"
     # 单次搜索超时（秒）
     search_timeout: float = 30.0
     # 兼容旧字段（已弃用，不再使用）
     serpapi_key: str = ""
+    serpapi_base_url: str = "https://serpapi.com/search"
+    serper_api_key: str = ""
+    serper_base_url: str = "https://google.serper.dev/search"
     bing_search_key: str = ""
 
     # 平台采集

@@ -141,7 +141,9 @@ npm run dev
 |---|---|---|
 | `ZHIPU_API_KEY` | 智谱开放平台 API Key（GLM 调用），从 https://open.bigmodel.cn 获取 | 是（真实 LLM 调用） |
 | `ZHIPU_MODEL` / `ZHIPU_MODEL_CORE` / `ZHIPU_MODEL_AUX` / `ZHIPU_MODEL_FAST` | 多模型矩阵（默认 / 核心章 / 辅助章 / 杂务） | 否（有默认值） |
-| `BOCHA_API_KEY` | 博查 Bocha Web Search Key，从 https://open.bocha.cn 获取（形如 `sk-xxxx`） | 真实联网采集时必填 |
+| `SEARCH_PROVIDER` | 搜索提供商：`serper`（推荐）、`bocha` 或 `serpapi` | 是 |
+| `SERPER_API_KEY` / `SERPER_BASE_URL` | Serper.dev Key 与接口地址（https://serper.dev/dashboard；默认 `https://google.serper.dev/search`） | 使用 Serper 时必填 |
+| `BOCHA_API_KEY` | 博查 Bocha Web Search Key，从 https://open.bocha.cn 获取（形如 `sk-xxxx`） | 使用 Bocha 时必填 |
 | `DOUYIN_COOKIE` / `BILIBILI_COOKIE` / `XHS_COOKIE` | 各平台舆情采集 cookie | 平台采集时按需 |
 | `APP_PORT` | 后端端口（默认 8000，本地脚本用 8010） | 否 |
 | `FRONTEND_ORIGIN` | 前端地址（CORS 白名单），默认 `http://localhost:3400` | 否 |
