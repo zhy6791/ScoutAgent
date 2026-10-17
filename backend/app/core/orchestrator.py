@@ -839,14 +839,16 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "scores": review_before.get("scores", {}),
                           "review": review_before.get("review", ""),
                           "issues": review_before.get("issues", []),
-                          "suggestions": review_before.get("suggestions", [])})
+                          "suggestions": review_before.get("suggestions", []),
+                          "issue_routes": review_before.get("issue_routes", [])})
     current_quality = quality_before
     current_review = review_before
     audit_rounds: List[Dict[str, Any]] = []
     rework_rounds_done = 0
     issues_resolved = 0
+    write_feedback: List[str] = []
     if cfg["rework_rounds"] > 0:
-        envelopes = build_rework_envelopes(current_quality, current_review)
+        envelopes = build_rework_envelopes(current_quality, current_review, brands)
         for _ in range(cfg["rework_rounds"]):
             if not envelopes:
                 break
@@ -860,7 +862,14 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                           "envelope": {"sender": env.sender, "receiver": env.receiver,
                                                        "task_type": env.task_type, "issues": env.issues}})
                     # 用更多角度补采（追加最新动态角度）
-                    extra_angles = angles + ["最新进展2026", "官方公告", "行业报告"]
+                    collect_feedback = " ".join(
+                        [x.get("reason", "") for x in env.issues if x.get("reason")] +
+                        list(env.payload.get("feedback", []))
+                    )
+                    feedback_angles = ["第三方评测", "独立来源", "用户口碑", "市场数据"]
+                    if any(word in collect_feedback for word in ("舆情", "声量", "情感")):
+                        feedback_angles.extend(["社区讨论", "用户评价"])
+                    extra_angles = angles + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
                     for b in recollect_brands[:3]:
                         trace.set_context(task_id, collector, "collect", f"返工补采「{b}」")
                         res = await asyncio.to_thread(_collect_brand, b, extra_angles[:cfg["max_angles"]],
@@ -888,16 +897,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                                        "task_type": env.task_type, "issues": env.issues}})
                     trace.set_context(task_id, analyst, "analyze", "返工：按质检意见针对性补全维度与交叉验证")
                     rework_fb = "\n".join(
-                        f"- 问题：{x}" for x in current_review.get("issues", [])[:5]
+                        f"- 问题：{x.get('reason', '')}" for x in env.issues[:8]
+                        if x.get("reason")
                     )
-                    if current_review.get("suggestions"):
+                    if env.payload.get("feedback"):
                         rework_fb += "\n" + "\n".join(
-                            f"- 建议：{x}" for x in current_review.get("suggestions", [])[:5]
-                        )
-                    if env.issues:
-                        rework_fb += "\n" + "\n".join(
-                            f"- 规则问题：{x.get('reason', '')}" for x in env.issues[:5]
-                            if x.get("reason")
+                            f"- 建议：{x}" for x in env.payload.get("feedback", [])[:8]
                         )
                     analysis = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
                                                        cfg["analyze_max_tokens"], rework_fb)
@@ -908,6 +913,17 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                                          cfg["structured_max_tokens"])
                     analysis["structured"] = structured
                     yield _ev("node_update", {"node": "analyze", "status": "done"})
+                elif env.receiver == "write":
+                    yield _ev("node_update", {"node": "audit", "status": "rework"})
+                    write_feedback.extend(
+                        x.get("reason", "") for x in env.issues if x.get("reason")
+                    )
+                    write_feedback.extend(env.payload.get("feedback", []))
+                    write_feedback = list(dict.fromkeys(x for x in write_feedback if x))
+                    yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
+                                          "reason": "报告表达类问题已路由至 write，后续章节将按反馈重写。",
+                                          "envelope": {"sender": env.sender, "receiver": env.receiver,
+                                                       "task_type": env.task_type, "issues": env.issues}})
             rework_rounds_done += 1
             current_quality = evaluate_quality(brands, focus, claims, evidences, structured)
             trace.set_context(task_id, auditor, "audit", "返工后重新执行 LLM 复审")
@@ -925,13 +941,14 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                   "review": current_review.get("review", ""),
                                   "issues": current_review.get("issues", []),
                                   "suggestions": current_review.get("suggestions", []),
+                                  "issue_routes": current_review.get("issue_routes", []),
                                   "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
             issues_resolved = max(issues_resolved,
                                   max(0, len(quality_before.issues) - len(current_quality.issues)))
             if quality_gate_passed(current_quality, current_review):
                 envelopes = []
             else:
-                envelopes = build_rework_envelopes(current_quality, current_review)
+                envelopes = build_rework_envelopes(current_quality, current_review, brands)
         quality_after = current_quality
     else:
         quality_after = quality_before
@@ -976,7 +993,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "text": f"首席分析师启动 {len(section_ids)} 章并行撰写（核心章 {_model('core')} / 辅助章 {_model('aux')}）。",
                           "ts": _now()})
 
-    # 并行生成各章
+    # 并行生成各章；write 类质检反馈在这里作为章节写作约束执行。
     sections_text: Dict[str, Dict[str, Any]] = {}
 
     async def _write_one(sid: str):
@@ -986,7 +1003,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         return sid, await asyncio.to_thread(
             _write_single_section, sid, title, query, brands, focus,
             evidences, claims, analysis, model,
-            cfg["min_paragraphs"], cfg["para_words"], cfg["section_max_tokens"]
+            cfg["min_paragraphs"], cfg["para_words"], cfg["section_max_tokens"],
+            "\n".join(write_feedback)
         )
 
     tasks = [asyncio.create_task(_write_one(sid)) for sid in section_ids]
@@ -1289,7 +1307,8 @@ SECTION_PROMPTS = {
 def _write_single_section(sid: str, title: str, query, brands, focus,
                           evidences, claims, analysis, model: str,
                           min_paragraphs: int = 5, para_words: str = "180-280",
-                          section_max_tokens: int = 6000) -> Dict[str, Any]:
+                          section_max_tokens: int = 6000,
+                          review_feedback: str = "") -> Dict[str, Any]:
     """单章独立生成：每章独立 token 预算 + 独立模型，失败不影响其他章节。
 
     篇幅深度由 min_paragraphs/para_words/section_max_tokens 三档动态控制
@@ -1344,6 +1363,12 @@ def _write_single_section(sid: str, title: str, query, brands, focus,
         extra += f"\n用户画像结构：{json.dumps(structured['user_persona'][:2], ensure_ascii=False)[:800]}"
 
     section_role = SECTION_PROMPTS.get(sid, "深度竞争分析章节")
+    writing_directive = ""
+    if review_feedback:
+        writing_directive = (
+            "\n\n【质检官写作返工要求 —— 必须执行】\n" + review_feedback +
+            "\n请在本章正文、核心判断和 highlights 中修正上述表达问题，避免重复、空泛和无依据的强断言。"
+        )
     try:
         data = chat_json(
             [
@@ -1364,7 +1389,7 @@ def _write_single_section(sid: str, title: str, query, brands, focus,
                 {"role": "user", "content": (
                     f"章节标题：{title}\n"
                     f"调研主题：{query}\n竞品：{'、'.join(brands)}\n重点：{'、'.join(focus)}\n"
-                    f"相关论点（含支撑 evidence_id）：\n{claim_text}\n{extra}\n\n证据摘要：\n{digest}"
+                    f"相关论点（含支撑 evidence_id）：\n{claim_text}\n{extra}{writing_directive}\n\n证据摘要：\n{digest}"
                 )},
             ],
             max_tokens=section_max_tokens,
@@ -1392,7 +1417,7 @@ def _write_single_section(sid: str, title: str, query, brands, focus,
                     f"你是资深竞品分析师，针对给定章节写不少于 {min_paragraphs} 段深度分析，"
                     f"每段约 {para_words} 字，论证层层递进，直接输出正文（不要 JSON、不要标题）。"
                 )},
-                {"role": "user", "content": f"章节：{title}\n主题：{query}\n竞品：{'、'.join(brands)}\n证据：\n{digest[:2000]}"},
+                {"role": "user", "content": f"章节：{title}\n主题：{query}\n竞品：{'、'.join(brands)}{writing_directive}\n证据：\n{digest[:2000]}"},
             ],
             max_tokens=section_max_tokens, temperature=0.7, model=model, purpose=f"重试撰写章节：{title}",
         )

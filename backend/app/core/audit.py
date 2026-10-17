@@ -1,7 +1,8 @@
 """质检与反馈闭环（对应需求 12：真实可触发的返工闭环）。
 
 evaluate_quality：基于 claims/evidences/structured 计算可量化质量指标 + 暴露问题（Issue）。
-decide_rework：根据质量指标决定是否打回 collect（补采）或 analyze（重分析），产出 Envelope。
+decide_rework：根据规则问题打回 collect（补采）或 analyze（重分析）。
+build_rework_envelopes：将 LLM 反馈分类为 collect/analyze/write，并生成对应 Envelope。
 """
 from __future__ import annotations
 
@@ -170,6 +171,12 @@ def llm_quality_review(
         "issues": [i.get("reason", "") for i in qr.issues[:6]],
         "suggestions": [],
     }
+    fallback["issue_routes"] = [
+        {"category": classify_review_issue(issue.get("reason", "")),
+         "issue": issue.get("reason", "")}
+        for issue in qr.issues[:6]
+        if issue.get("reason")
+    ]
     try:
         data = chat_json(
             [
@@ -181,7 +188,10 @@ def llm_quality_review(
                     '"scores":{"证据充分性":int,"维度完整性":int,"结论置信度":int,"结构化完整度":int,"交叉验证":int},'
                     '"review":"一段总体评审意见（点明亮点与短板）",'
                     '"issues":["具体问题1","具体问题2"],'
+                    '"issue_routes":[{"category":"collect|analyze|write","issue":"问题原文","suggestion":"对应改进动作"}],'
                     '"suggestions":["可执行改进建议1","改进建议2"]}。只输出 JSON。'
+                    "issue_routes 必须逐条为 issues 分类：证据不足/缺少来源/交叉验证/数据复现归 collect；"
+                    "论点逻辑/维度遗漏/Schema/置信度/结论结构归 analyze；表达、段落、标题、可读性、重复或写作风格归 write。"
                 )},
                 {"role": "user", "content": (
                     f"调研主题：{query}\n竞品：{'、'.join(brands)}\n重点维度：{'、'.join(focus)}\n"
@@ -201,6 +211,7 @@ def llm_quality_review(
                 "review": str(data.get("review") or fallback["review"]),
                 "issues": [str(x) for x in (data.get("issues") or []) if str(x).strip()][:8],
                 "suggestions": [str(x) for x in (data.get("suggestions") or []) if str(x).strip()][:8],
+                "issue_routes": normalize_issue_routes(data.get("issue_routes"), data.get("issues") or []),
             }
     except Exception:
         pass
@@ -221,6 +232,62 @@ def quality_gate_passed(qr: QualityReport, review: Dict[str, Any]) -> bool:
         and str((review or {}).get("verdict", "")).lower() == "pass"
         and not (review or {}).get("issues")
     )
+
+
+_REVIEW_ROUTE_KEYWORDS = {
+    "collect": ("证据", "来源", "信源", "引用", "单源", "交叉验证", "复现", "benchmark",
+                 "舆情数据", "声量", "情感数据", "市场份额数据", "样本", "口径未明"),
+    "write": ("表达", "表述", "文案", "写作", "段落", "标题", "可读性", "重复", "空泛",
+              "叙事", "语言", "格式", "报告结构", "语气"),
+    "analyze": ("论点", "逻辑", "维度", "schema", "结构化", "覆盖", "置信度", "结论",
+                "映射", "矩阵", "策略", "定性", "定量"),
+}
+
+
+def classify_review_issue(issue: str) -> str:
+    """Classify an audit issue into the executable rework owner.
+
+    The audit model supplies the primary category. This keyword fallback keeps old
+    model responses routable and deliberately defaults ambiguous feedback to analyze.
+    """
+    text = str(issue or "").lower()
+    for category in ("collect", "write", "analyze"):
+        if any(keyword.lower() in text for keyword in _REVIEW_ROUTE_KEYWORDS[category]):
+            return category
+    return "analyze"
+
+
+def normalize_issue_routes(raw_routes: Any, issues: Any) -> List[Dict[str, str]]:
+    """Normalize model-provided routes while preserving compatibility with string issues."""
+    normalized: List[Dict[str, str]] = []
+    valid = {"collect", "analyze", "write"}
+    if isinstance(raw_routes, list):
+        for item in raw_routes:
+            if not isinstance(item, dict):
+                continue
+            issue = str(item.get("issue") or item.get("text") or "").strip()
+            if not issue:
+                continue
+            category = str(item.get("category") or "").lower().strip()
+            if category not in valid:
+                category = classify_review_issue(issue)
+            normalized.append({
+                "category": category,
+                "issue": issue,
+                "suggestion": str(item.get("suggestion") or "").strip(),
+            })
+    if normalized:
+        routed_text = {item["issue"] for item in normalized}
+        for issue in issues if isinstance(issues, list) else []:
+            text = str(issue).strip()
+            if text and text not in routed_text:
+                normalized.append({"category": classify_review_issue(text), "issue": text, "suggestion": ""})
+        return normalized[:12]
+    for issue in issues if isinstance(issues, list) else []:
+        text = str(issue).strip()
+        if text:
+            normalized.append({"category": classify_review_issue(text), "issue": text, "suggestion": ""})
+    return normalized[:12]
 
 
 def decide_rework(qr: QualityReport) -> List[Envelope]:
@@ -256,34 +323,45 @@ def decide_rework(qr: QualityReport) -> List[Envelope]:
     return envelopes
 
 
-def build_rework_envelopes(qr: QualityReport, review: Dict[str, Any]) -> List[Envelope]:
-    """Build rule-driven work and ensure every failed gate has an analysis rework."""
+def build_rework_envelopes(qr: QualityReport, review: Dict[str, Any], brands: List[str] = None) -> List[Envelope]:
+    """Build rule and categorized LLM rework envelopes for collect/analyze/write."""
     envelopes = decide_rework(qr)
     if quality_gate_passed(qr, review):
         return []
 
-    has_collect = any(env.receiver == "collect" for env in envelopes)
-    has_analyze = any(env.receiver == "analyze" for env in envelopes)
-    if has_analyze:
-        return envelopes
-
-    issues = [str(item) for item in (review or {}).get("issues", []) if str(item).strip()]
-    suggestions = [str(item) for item in (review or {}).get("suggestions", []) if str(item).strip()]
+    routes = normalize_issue_routes((review or {}).get("issue_routes"), (review or {}).get("issues", []))
+    review_suggestions = [str(item).strip() for item in (review or {}).get("suggestions", []) if str(item).strip()]
     rule_reasons = [str(item.get("reason", "")) for item in qr.issues if item.get("reason")]
-    reasons = (issues + rule_reasons)[:6] or [
-        str((review or {}).get("review") or "规则检查或 LLM 复审未通过")
-    ]
-    envelopes.append(Envelope(
-        msg_id="env_" + uuid.uuid4().hex[:8],
-        sender="L3-003",
-        receiver="analyze",
-        task_type="REWORK",
-        payload={
-            "reason": "质检未通过，按最新反馈重新分析",
-            "suggestions": suggestions[:4],
-            "collect_rework": has_collect,
-        },
-        issues=[{"target": "review", "severity": "medium", "reason": reason, "raised_by": "L3-003"}
-                for reason in reasons],
-    ))
+    if not routes and rule_reasons:
+        routes = [{"category": "analyze", "issue": reason, "suggestion": ""} for reason in rule_reasons]
+    if not routes:
+        routes = [{"category": "analyze", "issue": str((review or {}).get("review") or "LLM 复审未通过"), "suggestion": ""}]
+
+    by_receiver = {env.receiver: env for env in envelopes}
+    for category in ("collect", "analyze", "write"):
+        category_routes = [route for route in routes if route["category"] == category]
+        if not category_routes:
+            continue
+        issues = [{"target": "review", "severity": "medium", "reason": route["issue"], "raised_by": "L3-003"}
+                  for route in category_routes[:8]]
+        suggestions = [route["suggestion"] for route in category_routes if route.get("suggestion")]
+        suggestions.extend(
+            suggestion for suggestion in review_suggestions
+            if classify_review_issue(suggestion) == category
+        )
+        if category in by_receiver:
+            env = by_receiver[category]
+            env.issues.extend(issues)
+            env.payload.setdefault("feedback", []).extend(suggestions)
+            env.payload.setdefault("suggestions", []).extend(suggestions)
+            continue
+        payload = {"reason": f"质检反馈归类为 {category}，执行对应返工",
+                   "feedback": suggestions, "suggestions": suggestions[:4]}
+        if category == "collect":
+            mentioned = [b for b in (brands or []) if any(b.lower() in route["issue"].lower() for route in category_routes)]
+            payload["brands"] = mentioned or list(brands or [])
+        envelopes.append(Envelope(
+            msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver=category,
+            task_type="REWORK", payload=payload, issues=issues,
+        ))
     return envelopes

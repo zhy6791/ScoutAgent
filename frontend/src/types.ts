@@ -216,6 +216,7 @@ export interface AuditOpinion {
   review?: string
   issues?: string[]
   suggestions?: string[]
+  issue_routes?: { category: 'collect' | 'analyze' | 'write'; issue: string; suggestion?: string }[]
 }
 
 export interface AuditReview {
