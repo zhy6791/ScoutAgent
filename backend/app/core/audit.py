@@ -214,6 +214,15 @@ def _clamp_score(v) -> int:
         return 0
 
 
+def quality_gate_passed(qr: QualityReport, review: Dict[str, Any]) -> bool:
+    """Return true only when rule checks and LLM review both pass."""
+    return (
+        not qr.issues
+        and str((review or {}).get("verdict", "")).lower() == "pass"
+        and not (review or {}).get("issues")
+    )
+
+
 def decide_rework(qr: QualityReport) -> List[Envelope]:
     """根据质量报告决定返工动作，产出结构化 Envelope 消息。"""
     envelopes: List[Envelope] = []
@@ -244,4 +253,37 @@ def decide_rework(qr: QualityReport) -> List[Envelope]:
             issues=analyze_targets,
         ))
 
+    return envelopes
+
+
+def build_rework_envelopes(qr: QualityReport, review: Dict[str, Any]) -> List[Envelope]:
+    """Build rule-driven work and ensure every failed gate has an analysis rework."""
+    envelopes = decide_rework(qr)
+    if quality_gate_passed(qr, review):
+        return []
+
+    has_collect = any(env.receiver == "collect" for env in envelopes)
+    has_analyze = any(env.receiver == "analyze" for env in envelopes)
+    if has_analyze:
+        return envelopes
+
+    issues = [str(item) for item in (review or {}).get("issues", []) if str(item).strip()]
+    suggestions = [str(item) for item in (review or {}).get("suggestions", []) if str(item).strip()]
+    rule_reasons = [str(item.get("reason", "")) for item in qr.issues if item.get("reason")]
+    reasons = (issues + rule_reasons)[:6] or [
+        str((review or {}).get("review") or "规则检查或 LLM 复审未通过")
+    ]
+    envelopes.append(Envelope(
+        msg_id="env_" + uuid.uuid4().hex[:8],
+        sender="L3-003",
+        receiver="analyze",
+        task_type="REWORK",
+        payload={
+            "reason": "质检未通过，按最新反馈重新分析",
+            "suggestions": suggestions[:4],
+            "collect_rework": has_collect,
+        },
+        issues=[{"target": "review", "severity": "medium", "reason": reason, "raised_by": "L3-003"}
+                for reason in reasons],
+    ))
     return envelopes

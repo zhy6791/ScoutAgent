@@ -221,8 +221,12 @@ export interface AuditOpinion {
 export interface AuditReview {
   before?: AuditOpinion
   after?: AuditOpinion
+  rounds?: { round: number; quality?: Record<string, unknown>; llm_review?: AuditOpinion; passed?: boolean }[]
+  final_verdict?: string
   rework_rounds?: number
   issues_resolved?: number
+  passed_quality_gate?: boolean
+  rework_exhausted?: boolean
 }
 
 export interface ReportFigure {

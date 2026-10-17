@@ -28,7 +28,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from app.core import charts as C
 from app.core import db
 from app.core import trace
-from app.core.audit import evaluate_quality, decide_rework, llm_quality_review
+from app.core.audit import evaluate_quality, build_rework_envelopes, llm_quality_review, quality_gate_passed
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
 from app.core.fetcher import domain_of, fetch_page
@@ -59,7 +59,7 @@ MODE_CONFIG = {
         "label": "快速模式",
         "max_angles": 4, "fetch_per_brand": 6, "platform_per": 6,
         "sections": ["summary", "overview", "feature", "pricing", "conclusion"],
-        "freshness": "oneYear", "rework_rounds": 0,
+        "freshness": "oneYear", "rework_rounds": 2,
         # 写作深度：段落数下限 / 每段字数 / 单章 token 预算
         "min_paragraphs": 3, "para_words": "120-200", "section_max_tokens": 3500,
         "analyze_max_tokens": 6000, "structured_max_tokens": 6000,
@@ -71,7 +71,7 @@ MODE_CONFIG = {
         "max_angles": 6, "fetch_per_brand": 12, "platform_per": 8,
         "sections": ["summary", "overview", "feature", "pricing", "persona",
                      "trend", "swot", "conclusion", "risk"],
-        "freshness": "oneYear", "rework_rounds": 1,
+        "freshness": "oneYear", "rework_rounds": 2,
         "min_paragraphs": 5, "para_words": "180-280", "section_max_tokens": 6000,
         "analyze_max_tokens": 8000, "structured_max_tokens": 8000,
         "sentiment_brands": 3, "platform_take": 8,
@@ -840,21 +840,13 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "review": review_before.get("review", ""),
                           "issues": review_before.get("issues", []),
                           "suggestions": review_before.get("suggestions", [])})
+    current_quality = quality_before
+    current_review = review_before
+    audit_rounds: List[Dict[str, Any]] = []
     rework_rounds_done = 0
     issues_resolved = 0
     if cfg["rework_rounds"] > 0:
-        envelopes = decide_rework(quality_before)
-        # 规则未触发但质检官 LLM 判定需返工 → 合成一个 analyze 返工信封，
-        # 让反馈闭环真实可触发（且复审后能看到改善），对齐评分维度。
-        if not envelopes and review_before.get("verdict") == "rework":
-            from app.core.models import Envelope as _Env
-            envelopes = [_Env(
-                msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver="analyze",
-                task_type="REWORK", payload={"reason": "质检官审阅判定需补强论证与交叉验证"},
-                issues=[{"target": "review", "severity": "medium",
-                         "reason": r, "raised_by": "L3-003"}
-                        for r in review_before.get("issues", [])[:4]],
-            )]
+        envelopes = build_rework_envelopes(current_quality, current_review)
         for _ in range(cfg["rework_rounds"]):
             if not envelopes:
                 break
@@ -896,11 +888,16 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                                        "task_type": env.task_type, "issues": env.issues}})
                     trace.set_context(task_id, analyst, "analyze", "返工：按质检意见针对性补全维度与交叉验证")
                     rework_fb = "\n".join(
-                        f"- 问题：{x}" for x in review_before.get("issues", [])[:5]
+                        f"- 问题：{x}" for x in current_review.get("issues", [])[:5]
                     )
-                    if review_before.get("suggestions"):
+                    if current_review.get("suggestions"):
                         rework_fb += "\n" + "\n".join(
-                            f"- 建议：{x}" for x in review_before.get("suggestions", [])[:5]
+                            f"- 建议：{x}" for x in current_review.get("suggestions", [])[:5]
+                        )
+                    if env.issues:
+                        rework_fb += "\n" + "\n".join(
+                            f"- 规则问题：{x.get('reason', '')}" for x in env.issues[:5]
+                            if x.get("reason")
                         )
                     analysis = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
                                                        cfg["analyze_max_tokens"], rework_fb)
@@ -912,21 +909,35 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                     analysis["structured"] = structured
                     yield _ev("node_update", {"node": "analyze", "status": "done"})
             rework_rounds_done += 1
-            quality_after_round = evaluate_quality(brands, focus, claims, evidences, structured)
-            issues_resolved = max(0, len(quality_before.issues) - len(quality_after_round.issues))
-            envelopes = decide_rework(quality_after_round)
-        quality_after = evaluate_quality(brands, focus, claims, evidences, structured)
+            current_quality = evaluate_quality(brands, focus, claims, evidences, structured)
+            trace.set_context(task_id, auditor, "audit", "返工后重新执行 LLM 复审")
+            current_review = await asyncio.to_thread(
+                llm_quality_review, query, brands, focus, claims, structured, current_quality, _model("aux"))
+            for e in _drain_trace():
+                yield e
+            audit_rounds.append({"round": rework_rounds_done, "quality": current_quality.to_dict(),
+                                 "llm_review": current_review,
+                                 "passed": quality_gate_passed(current_quality, current_review)})
+            yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
+                                  "stage": f"round_{rework_rounds_done}", "round": rework_rounds_done,
+                                  "verdict": current_review.get("verdict"),
+                                  "scores": current_review.get("scores", {}),
+                                  "review": current_review.get("review", ""),
+                                  "issues": current_review.get("issues", []),
+                                  "suggestions": current_review.get("suggestions", []),
+                                  "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
+            issues_resolved = max(issues_resolved,
+                                  max(0, len(quality_before.issues) - len(current_quality.issues)))
+            if quality_gate_passed(current_quality, current_review):
+                envelopes = []
+            else:
+                envelopes = build_rework_envelopes(current_quality, current_review)
+        quality_after = current_quality
     else:
         quality_after = quality_before
 
-    # 返工后再做一次质检复审，形成「审阅→返工→复审」的真实闭环（重做后有改善）
-    review_after = review_before
+    review_after = current_review
     if rework_rounds_done > 0:
-        trace.set_context(task_id, auditor, "audit", "质检官复审：返工后复核改善情况")
-        review_after = await asyncio.to_thread(
-            llm_quality_review, query, brands, focus, claims, structured, quality_after, _model("aux"))
-        for e in _drain_trace():
-            yield e
         # 解决问题数：综合「规则侧 issue 减少」「质检官 issue 减少」「评分提升的维度数」
         # 三者取最大，真实反映返工后的改善（LLM 每轮重新生成 issue 列表，单看条数会失真，
         # 故以『评分提升的维度数』作为最可靠的改善信号）。
@@ -935,19 +946,21 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         sc_a = review_after.get("scores", {}) or {}
         improved_dims = sum(1 for k in sc_a if k in sc_b and sc_a[k] > sc_b[k])
         issues_resolved = max(issues_resolved, review_issues_resolved, improved_dims)
-        yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
-                              "stage": "after",
-                              "verdict": review_after.get("verdict"),
-                              "scores": review_after.get("scores", {}),
-                              "review": review_after.get("review", ""),
-                              "issues": review_after.get("issues", []),
-                              "suggestions": review_after.get("suggestions", [])})
         yield _ev("message", {"id": _sid("m"), "kind": "rework_result", "expert": auditor,
-                              "reason": "返工闭环完成，覆盖度与置信度提升。",
+                              "reason": "返工闭环完成，已按最新一轮复审结果更新质检状态。",
                               "metrics_before": quality_before.summary(),
                               "metrics_after": quality_after.summary(),
                               "issues_resolved": issues_resolved})
-    yield _ev("node_update", {"node": "audit", "status": "done"})
+    passed_quality_gate = quality_gate_passed(quality_after, review_after)
+    rework_exhausted = not passed_quality_gate and rework_rounds_done >= int(cfg.get("rework_rounds", 2))
+    if rework_exhausted:
+        yield _ev("message", {"id": _sid("m"), "kind": "audit_rework_exhausted", "expert": auditor,
+                              "rounds": rework_rounds_done,
+                              "reason": "已达到 2 次返工上限，报告将以未通过质检状态继续生成",
+                              "passed_quality_gate": False})
+    yield _ev("node_update", {"node": "audit", "status": "done",
+                               "passed_quality_gate": passed_quality_gate,
+                               "rework_exhausted": rework_exhausted})
     yield _ev("progress", prog(70, "audit", len(evidences)))
 
     # ---- 6. write：多模型并行逐章撰写 ----
@@ -1027,10 +1040,14 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               analysis, metrics, quality_before.to_dict(),
                               quality_after.to_dict(), trace_spans, mode, section_ids,
                               sentiment_text)
-    # 质检审阅意见（before/after）随报告下发，供报告页「质检审裁」展示
+    # before 保留首次复审，after 指向最终一轮复审。
     report["audit_review"] = {"before": review_before, "after": review_after,
+                              "rounds": audit_rounds,
+                              "final_verdict": "pass" if passed_quality_gate else "rework",
                               "rework_rounds": rework_rounds_done,
-                              "issues_resolved": issues_resolved}
+                              "issues_resolved": issues_resolved,
+                              "passed_quality_gate": passed_quality_gate,
+                              "rework_exhausted": rework_exhausted}
     db.save_report(report, task_id=task_id)
     db.save_traces(task_id, report["id"], trace_spans)
     db.mark_task_done(task_id, report["id"])

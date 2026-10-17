@@ -11,7 +11,7 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
   // 主展示用复审结果（若有返工），否则用初审
   const main: AuditOpinion = (hasRework ? after : before) || {}
   const scoreKeys = Object.keys(main.scores ?? {})
-  const verdictPass = main.verdict !== 'rework'
+  const verdictPass = review.passed_quality_gate ?? main.verdict !== 'rework'
 
   function scoreColor(v: number) {
     if (v >= 80) return 'text-ok'
@@ -39,6 +39,12 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
         }`}>
           {verdictPass ? '✓ 达标签发' : '⟲ 触发返工'}
         </span>
+      </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-tag text-ink-3">
+        <span>最终复审：{(review.final_verdict ?? (verdictPass ? 'pass' : 'rework')) === 'pass' ? '通过' : '需返工'}</span>
+        <span>返工轮次：{review.rework_rounds ?? 0} / 2</span>
+        <span>双重质检：{review.passed_quality_gate ? '通过' : '未通过'}</span>
       </div>
 
       {/* 逐维度打分 */}
@@ -119,6 +125,11 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
         <div className="mt-4 flex items-center gap-2 rounded-card bg-sun-soft p-3 text-tag text-ink-2">
           <ShieldCheck size={14} className="text-warn" />
           质检触发 {review.rework_rounds} 轮返工，复审后解决了 {review.issues_resolved ?? 0} 项问题 —— 真实反馈闭环，重做后输出有改善。
+        </div>
+      )}
+      {review.rework_exhausted && (
+        <div className="mt-3 rounded-card border border-risk/30 bg-risk/10 p-3 text-tag text-risk">
+          已达到返工上限，当前报告未通过双重质检，后续内容仅作为草稿参考。
         </div>
       )}
     </div>
