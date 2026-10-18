@@ -43,7 +43,7 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
 
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-tag text-ink-3">
         <span>最终复审：{(review.final_verdict ?? (verdictPass ? 'pass' : 'rework')) === 'pass' ? '通过' : '需返工'}</span>
-        <span>返工轮次：{review.rework_rounds ?? 0} / 2</span>
+        <span>返工轮次：{review.rework_rounds ?? 0} / {review.max_rework_rounds ?? 2}</span>
         <span>双重质检：{review.passed_quality_gate ? '通过' : '未通过'}</span>
       </div>
 
@@ -119,6 +119,22 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
           </div>
         )}
       </div>
+
+      {main.advisories && main.advisories.length > 0 && (
+        <div className="mt-4">
+          <div className="flex items-center gap-1.5 text-tag font-semibold text-ink-2">
+            <Lightbulb size={13} /> 非阻断建议（{main.advisories.length}）
+          </div>
+          <ul className="mt-2 space-y-1.5">
+            {main.advisories.map((it, i) => (
+              <li key={i} className="flex gap-2 text-tag leading-relaxed text-ink-2">
+                <CheckCircle2 size={13} className="mt-0.5 shrink-0 text-ok" />
+                <span>{it}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* 返工闭环说明 */}
       {hasRework && (

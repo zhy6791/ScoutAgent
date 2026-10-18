@@ -216,7 +216,9 @@ export interface AuditOpinion {
   review?: string
   issues?: string[]
   suggestions?: string[]
+  advisories?: string[]
   issue_routes?: { category: 'collect' | 'analyze' | 'write'; issue: string; suggestion?: string }[]
+  review_failed?: boolean
 }
 
 export interface AuditReview {
@@ -225,6 +227,7 @@ export interface AuditReview {
   rounds?: { round: number; quality?: Record<string, unknown>; llm_review?: AuditOpinion; passed?: boolean }[]
   final_verdict?: string
   rework_rounds?: number
+  max_rework_rounds?: number
   issues_resolved?: number
   passed_quality_gate?: boolean
   rework_exhausted?: boolean

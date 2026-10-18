@@ -142,15 +142,17 @@ def llm_quality_review(
     qr: "QualityReport",
     model: str = None,
 ) -> Dict[str, Any]:
-    """质检官用 LLM 对当前分析做真实『审阅』（非纯规则）：逐维度打分 + 指出问题 + 给改进建议。
+    """质检官用 LLM 对当前分析做真实『审阅』（非纯规则）。
 
-    产出结构化评审意见，让「质检审裁」阶段有真实的对比、审阅与可执行的调优建议
-    （对应评分维度：反馈闭环真实可触发、重做后有改善）。失败时退回基于规则指标的兜底意见。
+    只有影响核心结论可靠性的阻断问题才进入 issues 并触发返工；非阻断问题进入
+    advisories。无阻断问题时即使仍有改进建议，也应判定为 pass。
     """
     from app.core.llm import chat_json
 
     claim_lines = "\n".join(
-        f"- [{c.get('confidence','?')}|{c.get('field','')}] {c.get('text','')}"
+        f"- [{c.get('confidence','?')}|{c.get('field','')}|"
+        f"证据{len(c.get('evidence_ids') or [])}条|"
+        f"交叉验证:{'是' if c.get('cross_validated') else '否'}] {c.get('text','')}"
         for c in claims[:18]
     ) or "（暂无论点）"
     sc_dims = "、".join(f"{k}:{'已覆盖' if v else '缺失'}"
@@ -158,63 +160,100 @@ def llm_quality_review(
     brand_cov = "、".join(f"{b}({v.get('domains',0)}域/{v.get('evidence',0)}证据)"
                          for b, v in qr.coverage_by_brand.items()) or "无"
     fallback = {
-        "verdict": "pass" if not qr.issues else "rework",
+        "verdict": "rework",
         "scores": {
             "证据充分性": round(qr.brand_coverage_rate * 100),
             "维度完整性": round(qr.dimension_coverage_rate * 100),
             "结论置信度": round(qr.confidence_ratio * 100),
             "结构化完整度": round(qr.schema_completeness * 100),
         },
-        "review": f"基于规则指标：维度覆盖 {round(qr.dimension_coverage_rate*100)}%、"
-                  f"品牌覆盖 {round(qr.brand_coverage_rate*100)}%、"
-                  f"高置信占比 {round(qr.confidence_ratio*100)}%。",
-        "issues": [i.get("reason", "") for i in qr.issues[:6]],
-        "suggestions": [],
+        "review": "LLM 复审未成功返回可解析结果，无法确认本轮质检通过。",
+        "issues": ["LLM 复审输出无效或调用失败，无法确认核心结论已通过语义质检。"],
+        "suggestions": ["重新执行 LLM 复审；在获得有效复审结果前不要标记为质检通过。"],
+        "advisories": [],
+        "review_failed": True,
     }
-    fallback["issue_routes"] = [
-        {"category": classify_review_issue(issue.get("reason", "")),
-         "issue": issue.get("reason", "")}
-        for issue in qr.issues[:6]
-        if issue.get("reason")
+    fallback["issue_routes"] = [{
+        "category": "analyze",
+        "issue": fallback["issues"][0],
+        "suggestion": fallback["suggestions"][0],
+    }]
+    messages = [
+        {"role": "system", "content": (
+            "你是竞品分析报告的质检官（L3 决策层）。请审阅下面的『分析中间产物』，"
+            "逐维度打分（0-100 整数），并区分阻断问题与非阻断建议。"
+            "只有会实质影响核心结论可靠性的问题才是阻断问题：核心结论无证据或与证据矛盾；"
+            "关键量化断言来自低可信单一来源且仍标为高置信；用户明确要求的关键维度完全缺失且未说明数据不可得；"
+            "待验证假设被当作高置信事实；严重逻辑矛盾或关键 Schema 缺失。"
+            "以下情况不得单独作为阻断问题：调研主体证据数少于某个竞品但已达到可用覆盖；"
+            "权威官方一手数据只有一个来源；非核心数字只有单一来源；表达或可读性可优化；"
+            "精确市场数据确实不公开但已披露数据缺口、代理指标和推断边界。"
+            "没有阻断问题时必须 verdict=pass；一般改进项放入 advisories，不得因此判 rework。"
+            "最多输出 5 个 blocking_issues 和 6 个 advisories。"
+            '只输出 JSON：{"verdict":"pass|rework",'
+            '"scores":{"证据充分性":int,"维度完整性":int,"结论置信度":int,"结构化完整度":int,"交叉验证":int},'
+            '"review":"总体评审意见",'
+            '"blocking_issues":[{"category":"collect|analyze|write","issue":"阻断问题","suggestion":"必要修复动作"}],'
+            '"advisories":["非阻断改进建议"]}。'
+            "问题路由规则：证据不足/缺少来源/交叉验证/数据复现归 collect；"
+            "论点逻辑/维度遗漏/Schema/置信度/结论结构归 analyze；"
+            "表达、段落、标题、可读性、重复或写作风格归 write。"
+        )},
+        {"role": "user", "content": (
+            f"调研主题：{query}\n竞品：{'、'.join(brands)}\n重点维度：{'、'.join(focus)}\n"
+            f"规则侧指标 → 维度覆盖：{sc_dims}；品牌证据覆盖：{brand_cov}；"
+            f"高置信占比：{round(qr.confidence_ratio*100)}%；结构化完整度：{round(qr.schema_completeness*100)}%\n"
+            f"已提炼论点：\n{claim_lines}"
+        )},
     ]
-    try:
-        data = chat_json(
-            [
-                {"role": "system", "content": (
-                    "你是竞品分析报告的质检官（L3 决策层）。请对下面这份『分析中间产物』做严格的质量审阅，"
-                    "像券商内核/主编终审一样，逐维度打分（0-100 整数，要有真实差异、不要清一色整十），"
-                    "指出具体问题，并给出可执行的改进建议。最后给整体结论 pass（达标）或 rework（需返工）。"
-                    '只输出 JSON：{"verdict":"pass|rework",'
-                    '"scores":{"证据充分性":int,"维度完整性":int,"结论置信度":int,"结构化完整度":int,"交叉验证":int},'
-                    '"review":"一段总体评审意见（点明亮点与短板）",'
-                    '"issues":["具体问题1","具体问题2"],'
-                    '"issue_routes":[{"category":"collect|analyze|write","issue":"问题原文","suggestion":"对应改进动作"}],'
-                    '"suggestions":["可执行改进建议1","改进建议2"]}。只输出 JSON。'
-                    "issue_routes 必须逐条为 issues 分类：证据不足/缺少来源/交叉验证/数据复现归 collect；"
-                    "论点逻辑/维度遗漏/Schema/置信度/结论结构归 analyze；表达、段落、标题、可读性、重复或写作风格归 write。"
-                )},
-                {"role": "user", "content": (
-                    f"调研主题：{query}\n竞品：{'、'.join(brands)}\n重点维度：{'、'.join(focus)}\n"
-                    f"规则侧指标 → 维度覆盖：{sc_dims}；品牌证据覆盖：{brand_cov}；"
-                    f"高置信占比：{round(qr.confidence_ratio*100)}%；结构化完整度：{round(qr.schema_completeness*100)}%\n"
-                    f"已提炼论点：\n{claim_lines}"
-                )},
-            ],
-            max_tokens=2000, temperature=0.3, model=model,
-            purpose="质检官审阅：逐维度打分+问题+改进建议",
-        )
-        if isinstance(data, dict) and data.get("scores"):
-            scores = {str(k): _clamp_score(v) for k, v in (data.get("scores") or {}).items()}
-            return {
-                "verdict": "rework" if str(data.get("verdict")) == "rework" else "pass",
-                "scores": scores or fallback["scores"],
-                "review": str(data.get("review") or fallback["review"]),
-                "issues": [str(x) for x in (data.get("issues") or []) if str(x).strip()][:8],
-                "suggestions": [str(x) for x in (data.get("suggestions") or []) if str(x).strip()][:8],
-                "issue_routes": normalize_issue_routes(data.get("issue_routes"), data.get("issues") or []),
-            }
-    except Exception:
-        pass
+    for _ in range(2):
+        try:
+            data = chat_json(
+                messages,
+                max_tokens=6000, temperature=0.3, model=model,
+                purpose="质检官审阅：区分阻断问题与非阻断建议",
+            )
+        except Exception:
+            continue
+        if not isinstance(data, dict) or not data.get("scores"):
+            continue
+
+        raw_blocking = data.get("blocking_issues")
+        if raw_blocking is None:
+            raw_blocking = data.get("issues") or []
+        blocking: List[Dict[str, str]] = []
+        for item in raw_blocking if isinstance(raw_blocking, list) else []:
+            if isinstance(item, dict):
+                issue = str(item.get("issue") or item.get("text") or "").strip()
+                suggestion = str(item.get("suggestion") or "").strip()
+                category = str(item.get("category") or "").lower().strip()
+            else:
+                issue = str(item).strip()
+                suggestion = ""
+                category = ""
+            if not issue:
+                continue
+            if category not in {"collect", "analyze", "write"}:
+                category = classify_review_issue(issue)
+            blocking.append({"category": category, "issue": issue, "suggestion": suggestion})
+        blocking = blocking[:5]
+        advisories = [
+            str(item).strip() for item in (data.get("advisories") or [])
+            if str(item).strip()
+        ][:6]
+        issues = [item["issue"] for item in blocking]
+        suggestions = [item["suggestion"] for item in blocking if item["suggestion"]]
+        scores = {str(k): _clamp_score(v) for k, v in (data.get("scores") or {}).items()}
+        return {
+            "verdict": "rework" if issues else "pass",
+            "scores": scores or fallback["scores"],
+            "review": str(data.get("review") or ""),
+            "issues": issues,
+            "suggestions": suggestions,
+            "advisories": advisories,
+            "issue_routes": blocking,
+            "review_failed": False,
+        }
     return fallback
 
 

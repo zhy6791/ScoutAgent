@@ -1,12 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 from app.core.audit import (
     QualityReport,
     build_rework_envelopes,
     classify_review_issue,
+    llm_quality_review,
     normalize_issue_routes,
     quality_gate_passed,
 )
+from app.core.orchestrator import MODE_CONFIG
 
 
 class QualityGateTests(unittest.TestCase):
@@ -26,6 +29,16 @@ class QualityGateTests(unittest.TestCase):
             QualityReport(), {"verdict": "pass", "issues": [], "suggestions": []}
         )
         self.assertEqual(envelopes, [])
+
+    def test_advisories_do_not_block_or_schedule_rework(self):
+        review = {
+            "verdict": "pass",
+            "issues": [],
+            "advisories": ["可以继续补充更多背景材料"],
+        }
+
+        self.assertTrue(quality_gate_passed(QualityReport(), review))
+        self.assertEqual(build_rework_envelopes(QualityReport(), review), [])
 
     def test_llm_only_failure_schedules_analysis_with_latest_feedback(self):
         envelopes = build_rework_envelopes(
@@ -84,6 +97,59 @@ class QualityGateTests(unittest.TestCase):
         ], [])
 
         self.assertEqual([route["category"] for route in routes], ["collect", "write"])
+
+    @patch("app.core.llm.chat_json")
+    def test_llm_review_passes_when_only_advisories_exist(self, mock_chat_json):
+        mock_chat_json.return_value = {
+            "verdict": "rework",  # The normalized verdict follows blockers, not this raw value.
+            "scores": {"证据充分性": 82, "维度完整性": 90},
+            "review": "核心结论可用，仍有一般改进空间。",
+            "blocking_issues": [],
+            "advisories": ["可增加更多背景材料"],
+        }
+
+        review = llm_quality_review("主题", ["A"], ["功能"], [], {}, QualityReport())
+
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(review["issues"], [])
+        self.assertEqual(review["advisories"], ["可增加更多背景材料"])
+        self.assertEqual(mock_chat_json.call_args.kwargs["max_tokens"], 6000)
+
+    @patch("app.core.llm.chat_json")
+    def test_llm_review_routes_only_blocking_issues_to_rework(self, mock_chat_json):
+        mock_chat_json.return_value = {
+            "verdict": "pass",
+            "scores": {"证据充分性": 55},
+            "review": "存在一个阻断问题。",
+            "blocking_issues": [{
+                "category": "collect",
+                "issue": "核心量化结论没有可核验来源",
+                "suggestion": "补充原始来源或降低结论强度",
+            }],
+            "advisories": ["标题可以更简洁"],
+        }
+
+        review = llm_quality_review("主题", ["A"], ["功能"], [], {}, QualityReport())
+        envelopes = build_rework_envelopes(QualityReport(), review, ["A"])
+
+        self.assertEqual(review["verdict"], "rework")
+        self.assertEqual(review["issues"], ["核心量化结论没有可核验来源"])
+        self.assertEqual([env.receiver for env in envelopes], ["collect"])
+
+    @patch("app.core.llm.chat_json", return_value=None)
+    def test_invalid_llm_review_fails_closed_after_one_retry(self, mock_chat_json):
+        review = llm_quality_review("主题", ["A"], ["功能"], [], {}, QualityReport())
+
+        self.assertEqual(mock_chat_json.call_count, 2)
+        self.assertEqual(review["verdict"], "rework")
+        self.assertTrue(review["review_failed"])
+        self.assertFalse(quality_gate_passed(QualityReport(), review))
+
+    def test_all_modes_allow_three_rework_rounds(self):
+        self.assertEqual(
+            {mode: config["rework_rounds"] for mode, config in MODE_CONFIG.items()},
+            {"quick": 3, "deep": 3, "expert": 3},
+        )
 
 
 if __name__ == "__main__":

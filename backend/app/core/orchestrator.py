@@ -59,7 +59,7 @@ MODE_CONFIG = {
         "label": "快速模式",
         "max_angles": 4, "fetch_per_brand": 6, "platform_per": 6,
         "sections": ["summary", "overview", "feature", "pricing", "conclusion"],
-        "freshness": "oneYear", "rework_rounds": 2,
+        "freshness": "oneYear", "rework_rounds": 3,
         # 写作深度：段落数下限 / 每段字数 / 单章 token 预算
         "min_paragraphs": 3, "para_words": "120-200", "section_max_tokens": 3500,
         "analyze_max_tokens": 6000, "structured_max_tokens": 6000,
@@ -71,7 +71,7 @@ MODE_CONFIG = {
         "max_angles": 6, "fetch_per_brand": 12, "platform_per": 8,
         "sections": ["summary", "overview", "feature", "pricing", "persona",
                      "trend", "swot", "conclusion", "risk"],
-        "freshness": "oneYear", "rework_rounds": 2,
+        "freshness": "oneYear", "rework_rounds": 3,
         "min_paragraphs": 5, "para_words": "180-280", "section_max_tokens": 6000,
         "analyze_max_tokens": 8000, "structured_max_tokens": 8000,
         "sentiment_brands": 3, "platform_take": 8,
@@ -82,7 +82,7 @@ MODE_CONFIG = {
         "sections": ["summary", "overview", "feature", "pricing", "persona",
                      "trend", "swot", "moat", "inflection", "contrarian",
                      "conclusion", "risk"],
-        "freshness": "oneYear", "rework_rounds": 2,
+        "freshness": "oneYear", "rework_rounds": 3,
         # 专家级：篇幅最长、最详尽（券商行研/MBB 深度报告级别）
         "min_paragraphs": 7, "para_words": "260-420", "section_max_tokens": 9000,
         "analyze_max_tokens": 9000, "structured_max_tokens": 9000,
@@ -840,16 +840,18 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "review": review_before.get("review", ""),
                           "issues": review_before.get("issues", []),
                           "suggestions": review_before.get("suggestions", []),
+                          "advisories": review_before.get("advisories", []),
                           "issue_routes": review_before.get("issue_routes", [])})
     current_quality = quality_before
     current_review = review_before
     audit_rounds: List[Dict[str, Any]] = []
     rework_rounds_done = 0
+    max_rework_rounds = int(cfg.get("rework_rounds", 3))
     issues_resolved = 0
     write_feedback: List[str] = []
-    if cfg["rework_rounds"] > 0:
+    if max_rework_rounds > 0:
         envelopes = build_rework_envelopes(current_quality, current_review, brands)
-        for _ in range(cfg["rework_rounds"]):
+        for _ in range(max_rework_rounds):
             if not envelopes:
                 break
             for env in envelopes:
@@ -941,6 +943,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                   "review": current_review.get("review", ""),
                                   "issues": current_review.get("issues", []),
                                   "suggestions": current_review.get("suggestions", []),
+                                  "advisories": current_review.get("advisories", []),
                                   "issue_routes": current_review.get("issue_routes", []),
                                   "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
             issues_resolved = max(issues_resolved,
@@ -969,11 +972,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "metrics_after": quality_after.summary(),
                               "issues_resolved": issues_resolved})
     passed_quality_gate = quality_gate_passed(quality_after, review_after)
-    rework_exhausted = not passed_quality_gate and rework_rounds_done >= int(cfg.get("rework_rounds", 2))
+    rework_exhausted = not passed_quality_gate and rework_rounds_done >= max_rework_rounds
     if rework_exhausted:
         yield _ev("message", {"id": _sid("m"), "kind": "audit_rework_exhausted", "expert": auditor,
                               "rounds": rework_rounds_done,
-                              "reason": "已达到 2 次返工上限，报告将以未通过质检状态继续生成",
+                              "max_rounds": max_rework_rounds,
+                              "reason": f"已达到 {max_rework_rounds} 次返工上限，报告将以未通过质检状态继续生成",
                               "passed_quality_gate": False})
     yield _ev("node_update", {"node": "audit", "status": "done",
                                "passed_quality_gate": passed_quality_gate,
@@ -1063,6 +1067,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "rounds": audit_rounds,
                               "final_verdict": "pass" if passed_quality_gate else "rework",
                               "rework_rounds": rework_rounds_done,
+                              "max_rework_rounds": max_rework_rounds,
                               "issues_resolved": issues_resolved,
                               "passed_quality_gate": passed_quality_gate,
                               "rework_exhausted": rework_exhausted}
@@ -1083,19 +1088,114 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
 
 
 # ── 分析：LLM 基于真实证据产出论点 + 结构化对比 ───────────────
-def _evidence_digest(evidences: List[Evidence], limit: int = 28) -> str:
+ANALYSIS_EVIDENCE_LIMIT = 72
+STRUCTURED_EVIDENCE_LIMIT = 60
+
+
+def _select_digest_evidences(evidences: List[Evidence], limit: int) -> List[Evidence]:
+    """按品牌轮询选证据，避免列表前部的品牌耗尽分析上下文。"""
+    if limit <= 0:
+        return []
+    groups: Dict[str, List[Evidence]] = {}
+    for evidence in evidences:
+        key = (evidence.brand or "未标注品牌").strip()
+        groups.setdefault(key, []).append(evidence)
+    # 每个品牌内部首尾交替：既保留首次采集的基础证据，也纳入列表尾部最新追加的返工证据。
+    for brand, items in groups.items():
+        spread: List[Evidence] = []
+        left, right = 0, len(items) - 1
+        while left <= right:
+            spread.append(items[left])
+            left += 1
+            if left <= right:
+                spread.append(items[right])
+                right -= 1
+        groups[brand] = spread
+
+    selected: List[Evidence] = []
+    offsets = {brand: 0 for brand in groups}
+    while len(selected) < limit:
+        added = False
+        for brand, items in groups.items():
+            offset = offsets[brand]
+            if offset >= len(items):
+                continue
+            selected.append(items[offset])
+            offsets[brand] = offset + 1
+            added = True
+            if len(selected) >= limit:
+                break
+        if not added:
+            break
+    return selected
+
+
+def _evidence_digest(evidences: List[Evidence], limit: int = ANALYSIS_EVIDENCE_LIMIT) -> str:
     lines = []
-    for e in evidences[:limit]:
+    for e in _select_digest_evidences(evidences, limit):
         d = domain_of(e.source_url)
-        lines.append(f"[{e.evidence_id}|{e.source_type}|{d}] {e.title}：{e.excerpt}")
+        brand = (e.brand or "未标注品牌").strip()
+        lines.append(
+            f"[{e.evidence_id}|品牌:{brand}|类型:{e.source_type}|域名:{d}] "
+            f"{e.title}：{e.excerpt}"
+        )
     return "\n".join(lines)
+
+
+_GENERIC_BRAND_WORDS = {"ai", "assistant", "助手", "智能", "平台", "产品"}
+
+
+def _mentioned_brands(text: str, brands: List[str]) -> List[str]:
+    """识别论点正文明确提到的品牌，作为证据归属硬校验的补充。"""
+    normalized = (text or "").casefold()
+    token_owners: Dict[str, set] = {}
+    for brand in brands:
+        for token in re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]+", brand or ""):
+            alias = token.casefold()
+            if len(alias) >= 4 and alias not in _GENERIC_BRAND_WORDS:
+                token_owners.setdefault(alias, set()).add(brand)
+    found: List[str] = []
+    for brand in brands:
+        full = (brand or "").strip()
+        if not full:
+            continue
+        aliases = {full.casefold()}
+        for token in re.findall(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]+", full):
+            alias = token.casefold()
+            if len(alias) >= 4 and len(token_owners.get(alias, ())) == 1:
+                aliases.add(alias)
+        if any(alias in normalized for alias in aliases):
+            found.append(brand)
+    return found
+
+
+def _claim_evidence_matches_brands(
+    text: str,
+    declared_brands: Any,
+    evidence_ids: List[str],
+    brands: List[str],
+    brand_by_id: Dict[str, str],
+) -> bool:
+    """涉及某品牌的论点，必须至少引用一条归属于该品牌的证据。"""
+    required = _mentioned_brands(text, brands)
+    if isinstance(declared_brands, list):
+        for declared in declared_brands:
+            for brand in _mentioned_brands(str(declared), brands):
+                if brand not in required:
+                    required.append(brand)
+    if not required:
+        return False
+    evidence_brands = {brand_by_id.get(eid, "") for eid in evidence_ids}
+    return all(brand in evidence_brands for brand in required)
 
 
 def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str],
              max_tokens_param: int = 8000, review_feedback: str = "") -> Dict[str, Any]:
-    digest = _evidence_digest(evidences)
+    digest_evidences = _select_digest_evidences(evidences, ANALYSIS_EVIDENCE_LIMIT)
+    digest = _evidence_digest(digest_evidences, limit=len(digest_evidences))
     ev_ids = [e.evidence_id for e in evidences]
     domains_by_id = {e.evidence_id: domain_of(e.source_url) for e in evidences}
+    brand_by_id = {e.evidence_id: e.brand for e in evidences}
     authors = [m for m in members if m.startswith(("L1", "L2"))] or ["L2-001"]
     # 返工时把质检官的具体意见注入提示，让重分析真正针对短板调优（而非重抽一遍）
     rework_directive = ""
@@ -1108,7 +1208,7 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
         )
 
     fallback = {
-        "claims": _fallback_claims(brands, ev_ids, domains_by_id, authors),
+        "claims": _fallback_claims(brands, ev_ids, domains_by_id, authors, brand_by_id),
         "comparison": {"dimensions": ["功能完整度", "易用性", "性价比", "生态", "口碑"],
                        "scores": [{"brand": b, "values": []} for b in brands[:4]]},
         "pricing": [{"brand": b, "entry_price": None} for b in brands[:4]],
@@ -1123,8 +1223,10 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
                     "你是顶尖投行/券商行研级别的资深竞品分析师，对标高盛、麦肯锡、字节战略部的分析深度。"
                     "基于给定证据（每条带 evidence_id），提炼结构化、有锋芒、敢下判断的竞争洞察。"
                     "严格要求：每条结论的 evidence_ids 必须来自给定证据的真实 id；无证据支撑的结论不要输出；数字尽量带来源。"
+                    "每条结论还必须输出 brands，列出该结论实际评价或比较的品牌；每个 brands 中的品牌都必须至少有一条同品牌证据，"
+                    "不得使用其他竞品的证据替代该品牌自身证据。"
                     "输出 JSON：{"
-                    '"claims":[{"text":"一句话锐利结论（要有判断不要套话）","field":"overview|feature_tree|pricing_model|user_persona|swot|trend","evidence_ids":["真实id"],"author":"专家id"}],'
+                    '"claims":[{"text":"一句话锐利结论（要有判断不要套话）","brands":["该论点涉及的竞品"],"field":"overview|feature_tree|pricing_model|user_persona|swot|trend","evidence_ids":["真实id"],"author":"专家id"}],'
                     '"comparison":{"dimensions":["能力维度,5-6个"],"scores":[{"brand":"竞品","values":[0-100整数,与dimensions等长]}]},'
                     '"pricing":[{"brand":"竞品","entry_price":数字或null,"note":"定价模式与策略解读"}],'
                     '"market_share":[{"name":"竞品","value":百分比整数}],'
@@ -1149,11 +1251,16 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
         )
         if isinstance(data, dict) and data.get("claims"):
             claims = []
-            valid_ids = set(ev_ids)
+            # LLM 只能引用本次实际展示过的证据；同时校验证据归属与论点品牌一致。
+            valid_ids = {e.evidence_id for e in digest_evidences}
             for c in data["claims"]:
                 if not isinstance(c, dict) or not c.get("text"):
                     continue
                 eids = [i for i in c.get("evidence_ids", []) if i in valid_ids]
+                if not _claim_evidence_matches_brands(
+                    c["text"], c.get("brands"), eids, brands, brand_by_id
+                ):
+                    continue
                 indep = len({domains_by_id.get(i, "") for i in eids if domains_by_id.get(i)})
                 author = c.get("author") if c.get("author") in members else authors[0]
                 claims.append(make_claim(_sid("c"), c["text"], c.get("field", "overview"),
@@ -1179,15 +1286,18 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
 def _analyze_structured(query, brands, focus, evidences: List[Evidence],
                         max_tokens_param: int = 8000) -> Dict[str, Any]:
     """产出结构化竞品知识：功能树 / 定价模型 / 用户画像（严格 Schema + 引用强制）。"""
-    digest = _evidence_digest(evidences, limit=24)
-    valid_eids = {e.evidence_id for e in evidences}
+    digest_evidences = _select_digest_evidences(evidences, STRUCTURED_EVIDENCE_LIMIT)
+    digest = _evidence_digest(digest_evidences, limit=len(digest_evidences))
+    valid_eids = {e.evidence_id for e in digest_evidences}
+    brand_by_id = {e.evidence_id: e.brand for e in digest_evidences}
     out = {"feature_tree": [], "pricing_model": [], "user_persona": []}
     try:
         data = chat_json(
             [
                 {"role": "system", "content": (
                     "你是竞品知识结构化专家。基于给定证据（每条带 evidence_id），为每个竞品输出严格结构化的 JSON。"
-                    "字段必须完整、格式一致。evidence_ids 必须来自给定证据真实 id（无则留空数组）。输出 JSON：{"
+                    "字段必须完整、格式一致。evidence_ids 必须来自给定证据真实 id，并且必须与对象的 brand 相同；"
+                    "不得把其他竞品证据挂到当前品牌（无同品牌证据则留空数组）。输出 JSON：{"
                     '"feature_tree":[{"brand":"竞品","modules":[{"category":"模块分类","name":"模块名","sub_features":[{"name":"子功能","support":"full|partial|none","note":"说明","evidence_ids":["id"]}]}]}],'
                     '"pricing_model":[{"brand":"竞品","currency":"CNY|USD","model_type":"subscription|usage|freemium|one_time|free","free_tier":true/false,"tiers":[{"name":"档位名","price":数字或null,"period":"月|年","unit":"人/席","target_user":"目标用户","includes":["权益"],"evidence_ids":["id"]}]}],'
                     '"user_persona":[{"brand":"竞品","personas":[{"name":"画像名","segment":"细分人群","needs":["需求"],"scenarios":["场景"],"pain_points":["痛点"],"decision_factors":["决策因素"],"migration_cost":"迁移成本描述","evidence_ids":["id"]}]}]}。'
@@ -1206,9 +1316,32 @@ def _analyze_structured(query, brands, focus, evidences: List[Evidence],
             out["feature_tree"] = coerce_feature_tree(data, valid_eids)
             out["pricing_model"] = coerce_pricing_model(data, valid_eids)
             out["user_persona"] = coerce_user_persona(data, valid_eids)
+            _filter_structured_evidence_by_brand(out, brand_by_id)
     except Exception:
         pass
     return out
+
+
+def _filter_structured_evidence_by_brand(
+    structured: Dict[str, Any], brand_by_id: Dict[str, str]
+) -> None:
+    """移除结构化对象中归属于其他竞品的引用。"""
+    nested_paths = {
+        "feature_tree": ("modules", "sub_features"),
+        "pricing_model": ("tiers",),
+        "user_persona": ("personas",),
+    }
+    for section, path in nested_paths.items():
+        for brand_item in structured.get(section, []):
+            brand = brand_item.get("brand", "")
+            leaves = [brand_item]
+            for key in path:
+                leaves = [child for parent in leaves for child in parent.get(key, [])]
+            for leaf in leaves:
+                leaf["evidence_ids"] = [
+                    eid for eid in leaf.get("evidence_ids", [])
+                    if brand_by_id.get(eid) == brand
+                ]
 
 
 def _sanitize_share(share: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1222,12 +1355,27 @@ def _sanitize_share(share: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return clean
 
 
-def _fallback_claims(brands, ev_ids, domains_by_id, authors) -> List[Dict[str, Any]]:
+def _fallback_claims(brands, ev_ids, domains_by_id, authors,
+                     brand_by_id=None) -> List[Dict[str, Any]]:
     """LLM 不可用时，仍只输出挂真实证据的结论（不编造内容主张，仅做归纳陈述）。"""
-    indep = len({domains_by_id.get(i, "") for i in ev_ids[:3] if domains_by_id.get(i)})
+    brand_by_id = brand_by_id or {}
+    fallback_ids = []
+    covered_brands = []
+    for brand in brands:
+        representative = next((eid for eid in ev_ids if brand_by_id.get(eid) == brand), None)
+        if representative:
+            fallback_ids.append(representative)
+            covered_brands.append(brand)
+    for eid in ev_ids:
+        if len(fallback_ids) >= max(3, len(brands)):
+            break
+        if eid not in fallback_ids:
+            fallback_ids.append(eid)
+    indep = len({domains_by_id.get(i, "") for i in fallback_ids if domains_by_id.get(i)})
+    scope = "、".join(covered_brands) if covered_brands else "当前调研对象"
     out = [make_claim(_sid("c"),
-                      f"已就 {'、'.join(brands)} 采集到多源公开证据，下列结论均挂载真实来源以供溯源。",
-                      "overview", ev_ids[:3], authors[0], indep).to_dict()]
+                      f"已就 {scope} 采集到公开证据，后续结论应以可溯源材料为准。",
+                      "overview", fallback_ids, authors[0], indep).to_dict()]
     return out
 
 
