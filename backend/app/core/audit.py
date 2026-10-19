@@ -405,4 +405,83 @@ def build_rework_envelopes(qr: QualityReport, review: Dict[str, Any], brands: Li
             msg_id="env_" + uuid.uuid4().hex[:8], sender="L3-003", receiver=category,
             task_type="REWORK", payload=payload, issues=issues,
         ))
-    return envelopes
+    return ensure_collect_reanalysis(envelopes)
+
+
+def ensure_collect_reanalysis(envelopes: List[Envelope]) -> List[Envelope]:
+    """Ensure evidence collection rework is consumed by the analysis stage.
+
+    A collect-only review would otherwise update evidence coverage while leaving
+    Claims and structured knowledge generated from the previous evidence set.
+    Insert a synthetic analyze Envelope immediately after the collect Envelopes
+    when the current round did not already schedule analysis.
+    """
+    if not any(env.receiver == "collect" for env in envelopes):
+        return envelopes
+    if any(env.receiver == "analyze" for env in envelopes):
+        return envelopes
+
+    collect_envelopes = [env for env in envelopes if env.receiver == "collect"]
+    feedback: List[str] = []
+    issues: List[Dict[str, Any]] = []
+    for env in collect_envelopes:
+        issues.extend(env.issues)
+        for key in ("feedback", "suggestions"):
+            values = env.payload.get(key, [])
+            if not isinstance(values, list):
+                values = [values]
+            feedback.extend(str(item).strip() for item in values if str(item).strip())
+    feedback = list(dict.fromkeys(feedback))
+    if not issues:
+        issues = [{
+            "target": "review",
+            "severity": "medium",
+            "reason": "采集返工已补充证据，必须重新分析以消费新增证据。",
+            "raised_by": "L3-003",
+        }]
+    analyze_env = Envelope(
+        msg_id="env_" + uuid.uuid4().hex[:8],
+        sender="L3-003",
+        receiver="analyze",
+        task_type="REWORK",
+        payload={
+            "reason": "采集返工完成后强制重新分析，确保新增证据进入 Claims 和结构化知识。",
+            "feedback": feedback,
+            "source": "collect_rework",
+        },
+        issues=issues,
+    )
+    insert_at = max(index for index, env in enumerate(envelopes) if env.receiver == "collect") + 1
+    return envelopes[:insert_at] + [analyze_env] + envelopes[insert_at:]
+
+
+def partition_rework_envelopes(envelopes: List[Envelope]) -> tuple[List[Envelope], List[Envelope]]:
+    """Split material analysis rework from pre-write constraints."""
+    analysis_rework = [env for env in envelopes if env.receiver in {"collect", "analyze"}]
+    write_constraints = [env for env in envelopes if env.receiver == "write"]
+    return analysis_rework, write_constraints
+
+
+def accept_write_constraints(review: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark a write-only review as passed by the analysis quality gate.
+
+    Write issues cannot be verified before a report exists. They are preserved as
+    writing constraints and must not consume an analysis rework round.
+    """
+    updated = dict(review or {})
+    routes = normalize_issue_routes(updated.get("issue_routes"), updated.get("issues", []))
+    write_routes = [route for route in routes if route["category"] == "write"]
+    constraints: List[str] = []
+    for route in write_routes:
+        constraints.append(route["issue"])
+        if route.get("suggestion"):
+            constraints.append(route["suggestion"])
+    constraints = list(dict.fromkeys(item for item in constraints if item))
+    updated["original_verdict"] = updated.get("verdict")
+    updated["verdict"] = "pass"
+    updated["issues"] = []
+    updated["suggestions"] = []
+    updated["issue_routes"] = []
+    updated["writing_constraints"] = constraints
+    updated["write_constraints_deferred"] = bool(constraints)
+    return updated

@@ -212,6 +212,7 @@ export interface Report {
 
 export interface AuditOpinion {
   verdict?: string
+  original_verdict?: string
   scores?: Record<string, number>
   review?: string
   issues?: string[]
@@ -219,6 +220,8 @@ export interface AuditOpinion {
   advisories?: string[]
   issue_routes?: { category: 'collect' | 'analyze' | 'write'; issue: string; suggestion?: string }[]
   review_failed?: boolean
+  writing_constraints?: string[]
+  write_constraints_deferred?: boolean
 }
 
 export interface AuditReview {
@@ -229,6 +232,7 @@ export interface AuditReview {
   rework_rounds?: number
   max_rework_rounds?: number
   issues_resolved?: number
+  writing_constraints?: string[]
   passed_quality_gate?: boolean
   rework_exhausted?: boolean
 }

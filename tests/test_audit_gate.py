@@ -3,10 +3,12 @@ from unittest.mock import patch
 
 from app.core.audit import (
     QualityReport,
+    accept_write_constraints,
     build_rework_envelopes,
     classify_review_issue,
     llm_quality_review,
     normalize_issue_routes,
+    partition_rework_envelopes,
     quality_gate_passed,
 )
 from app.core.orchestrator import MODE_CONFIG
@@ -58,6 +60,71 @@ class QualityGateTests(unittest.TestCase):
         envelopes = build_rework_envelopes(quality, {"verdict": "pass", "issues": []})
 
         self.assertEqual({env.receiver for env in envelopes}, {"collect", "analyze"})
+
+    def test_collect_only_rework_forces_analysis_after_collection(self):
+        review = {
+            "verdict": "rework",
+            "issues": ["核心量化结论缺少可核验来源"],
+            "issue_routes": [{
+                "category": "collect",
+                "issue": "核心量化结论缺少可核验来源",
+                "suggestion": "补充原始来源后重新计算结论",
+            }],
+            "suggestions": ["补充原始来源后重新计算结论"],
+        }
+        envelopes = build_rework_envelopes(QualityReport(), review, ["Trae"])
+        self.assertEqual([env.receiver for env in envelopes], ["collect", "analyze"])
+        self.assertEqual(envelopes[1].payload["source"], "collect_rework")
+        self.assertIn("补充原始来源后重新计算结论", envelopes[1].payload["feedback"])
+
+    def test_existing_analyze_route_is_not_duplicated(self):
+        review = {
+            "verdict": "rework",
+            "issues": ["缺少来源", "论点逻辑不完整"],
+            "issue_routes": [
+                {"category": "collect", "issue": "缺少来源"},
+                {"category": "analyze", "issue": "论点逻辑不完整"},
+            ],
+        }
+        envelopes = build_rework_envelopes(QualityReport(), review, ["Trae"])
+        self.assertEqual([env.receiver for env in envelopes], ["collect", "analyze"])
+
+    def test_write_only_feedback_passes_analysis_gate_without_rework(self):
+        review = {
+            "verdict": "rework",
+            "issues": ["正文段落重复，表达需要压缩"],
+            "issue_routes": [{
+                "category": "write",
+                "issue": "正文段落重复，表达需要压缩",
+                "suggestion": "写作时合并重复段落",
+            }],
+        }
+        envelopes = build_rework_envelopes(QualityReport(), review, ["Trae"])
+        analysis_envelopes, write_envelopes = partition_rework_envelopes(envelopes)
+
+        self.assertEqual(analysis_envelopes, [])
+        self.assertEqual([env.receiver for env in write_envelopes], ["write"])
+        accepted = accept_write_constraints(review)
+        self.assertTrue(quality_gate_passed(QualityReport(), accepted))
+        self.assertEqual(accepted["original_verdict"], "rework")
+        self.assertEqual(accepted["writing_constraints"], [
+            "正文段落重复，表达需要压缩", "写作时合并重复段落",
+        ])
+
+    def test_mixed_feedback_keeps_analysis_rework_and_write_constraints(self):
+        review = {
+            "verdict": "rework",
+            "issues": ["缺少来源", "正文表达重复"],
+            "issue_routes": [
+                {"category": "collect", "issue": "缺少来源"},
+                {"category": "write", "issue": "正文表达重复"},
+            ],
+        }
+        envelopes = build_rework_envelopes(QualityReport(), review, ["Trae"])
+        analysis_envelopes, write_envelopes = partition_rework_envelopes(envelopes)
+
+        self.assertEqual([env.receiver for env in analysis_envelopes], ["collect", "analyze"])
+        self.assertEqual([env.receiver for env in write_envelopes], ["write"])
 
     def test_rule_dimension_failure_schedules_analysis(self):
         quality = QualityReport(issues=[{
@@ -134,7 +201,7 @@ class QualityGateTests(unittest.TestCase):
 
         self.assertEqual(review["verdict"], "rework")
         self.assertEqual(review["issues"], ["核心量化结论没有可核验来源"])
-        self.assertEqual([env.receiver for env in envelopes], ["collect"])
+        self.assertEqual([env.receiver for env in envelopes], ["collect", "analyze"])
 
     @patch("app.core.llm.chat_json", return_value=None)
     def test_invalid_llm_review_fails_closed_after_one_retry(self, mock_chat_json):

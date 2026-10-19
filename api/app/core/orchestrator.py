@@ -28,7 +28,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from app.core import charts as C
 from app.core import db
 from app.core import trace
-from app.core.audit import evaluate_quality, build_rework_envelopes, llm_quality_review, quality_gate_passed
+from app.core.audit import (accept_write_constraints, build_rework_envelopes,
+                             evaluate_quality, llm_quality_review,
+                             partition_rework_envelopes, quality_gate_passed)
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
 from app.core.fetcher import domain_of, fetch_page
@@ -232,8 +234,26 @@ def _discover_scope(query: str) -> Dict[str, Any]:
     """领域识别 + 竞品自动发现（前置侦察）。
 
     返回 {"subject": 调研对象, "domain": 所属领域, "competitors": [候选竞品...]}。
-    用 aux 模型（glm-5.1，已关思考、JSON 稳定）；失败重试一次再正则兜底。
+    先用现有搜索服务获取候选线索，再交给 aux 模型归纳；搜索失败时保留 LLM 兜底。
     """
+    search_subject = query
+    search_queries = [
+        f"{search_subject} 竞品",
+        f"{search_subject} 替代品",
+        f"{search_subject} 同类产品",
+    ]
+    try:
+        search_hits = multi_search(search_queries, num=8, freshness="oneYear")
+    except Exception:
+        search_hits = []
+    search_lines = []
+    for idx, item in enumerate(search_hits[:24], 1):
+        title = str(item.get("title") or "").strip()
+        snippet = str(item.get("snippet") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if title or snippet:
+            search_lines.append(f"[{idx}] {title}\n摘要：{snippet}\n来源：{url}")
+    search_context = "\n".join(search_lines) or "（本轮未获得联网结果，仅使用模型兜底）"
     msgs = [
         {"role": "system", "content": (
             "你是竞品分析调研总监，负责开题前的『领域识别 + 竞品发现』。"
@@ -241,9 +261,16 @@ def _discover_scope(query: str) -> Dict[str, Any]:
             "②它属于什么细分领域/赛道；③在该赛道里，尽可能多地列出与之直接竞争的真实竞品（8-12 个，"
             "必须是真实存在、可搜索的产品/公司名，按知名度从高到低排列，不要编造）。"
             '只输出 JSON：{"subject":"调研对象全称","domain":"细分领域/赛道","competitors":["竞品1","竞品2"]}。'
-            "competitors 不要包含调研对象自身。只输出 JSON，不要任何解释或思考过程。"
+            "competitors 不要包含调研对象自身。优先选择与调研对象同一细分赛道、"
+            "同一目标用户和相近购买场景的直接竞品；不要因为产品都带有 AI 就列入泛化替代品。"
+            "只输出 JSON，不要任何解释或思考过程。"
         )},
-        {"role": "user", "content": query},
+        {"role": "user", "content": (
+            f"用户需求：{query}\n\n"
+            "以下是刚刚联网检索得到的候选线索。候选必须优先来自这些标题或摘要，"
+            "不要凭空扩展；如果线索不足，可以少列，但不要用泛化产品凑数。\n"
+            f"{search_context}"
+        )},
     ]
     for _ in range(2):
         try:
@@ -254,10 +281,10 @@ def _discover_scope(query: str) -> Dict[str, Any]:
             if isinstance(data, dict) and (data.get("subject") or data.get("competitors")):
                 subject = str(data.get("subject") or "").strip()
                 domain = str(data.get("domain") or "").strip()
-                comps = [str(c).strip() for c in (data.get("competitors") or [])
+                model_comps = [str(c).strip() for c in (data.get("competitors") or [])
                          if str(c).strip() and str(c).strip() != subject]
                 seen = set()
-                comps = [c for c in comps if not (c in seen or seen.add(c))]
+                comps = [c for c in model_comps if not (c in seen or seen.add(c))]
                 return {"subject": subject, "domain": domain, "competitors": comps[:12]}
         except Exception:
             pass
@@ -849,112 +876,125 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     max_rework_rounds = int(cfg.get("rework_rounds", 3))
     issues_resolved = 0
     write_feedback: List[str] = []
-    if max_rework_rounds > 0:
-        envelopes = build_rework_envelopes(current_quality, current_review, brands)
-        for _ in range(max_rework_rounds):
-            if not envelopes:
-                break
-            for env in envelopes:
-                if env.receiver == "collect":
-                    recollect_brands = env.payload.get("brands", [])
-                    yield _ev("node_update", {"node": "audit", "status": "rework"})
-                    yield _ev("node_update", {"node": "collect", "status": "rework"})
-                    yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
-                                          "reason": f"证据不足，打回采集补充：{('、'.join(recollect_brands)) or '相关品牌'}",
-                                          "envelope": {"sender": env.sender, "receiver": env.receiver,
-                                                       "task_type": env.task_type, "issues": env.issues}})
-                    # 用更多角度补采（追加最新动态角度）
-                    collect_feedback = " ".join(
-                        [x.get("reason", "") for x in env.issues if x.get("reason")] +
-                        list(env.payload.get("feedback", []))
-                    )
-                    feedback_angles = ["第三方评测", "独立来源", "用户口碑", "市场数据"]
-                    if any(word in collect_feedback for word in ("舆情", "声量", "情感")):
-                        feedback_angles.extend(["社区讨论", "用户评价"])
-                    extra_angles = angles + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
-                    for b in recollect_brands[:3]:
-                        trace.set_context(task_id, collector, "collect", f"返工补采「{b}」")
-                        res = await asyncio.to_thread(_collect_brand, b, extra_angles[:cfg["max_angles"]],
-                                                      collector, cfg["fetch_per_brand"], cfg["freshness"], seen_urls)
-                        for e in _drain_trace():
-                            yield e
-                        for ev in res["evidences"]:
-                            evidences.append(ev)
-                            ev_by_collector[collector] += 1
-                            d = ev.to_dict()
-                            d["domain"] = domain_of(ev.source_url)
-                            d["brand"] = ev.brand
-                            d["full_text"] = getattr(ev, "_full_text", "")
-                            yield _ev("evidence", {**d})
-                        for fig in res["images"]:
-                            images.append(fig)
-                            yield _ev("image", fig)
-                    yield _ev("node_update", {"node": "collect", "status": "done"})
-                elif env.receiver == "analyze":
-                    yield _ev("node_update", {"node": "audit", "status": "rework"})
-                    yield _ev("node_update", {"node": "analyze", "status": "rework"})
-                    yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
-                                          "reason": "维度/结构覆盖不足，打回重新分析补全。",
-                                          "envelope": {"sender": env.sender, "receiver": env.receiver,
-                                                       "task_type": env.task_type, "issues": env.issues}})
-                    trace.set_context(task_id, analyst, "analyze", "返工：按质检意见针对性补全维度与交叉验证")
-                    rework_fb = "\n".join(
-                        f"- 问题：{x.get('reason', '')}" for x in env.issues[:8]
-                        if x.get("reason")
-                    )
-                    if env.payload.get("feedback"):
-                        rework_fb += "\n" + "\n".join(
-                            f"- 建议：{x}" for x in env.payload.get("feedback", [])[:8]
-                        )
-                    analysis = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
-                                                       cfg["analyze_max_tokens"], rework_fb)
+    envelopes = build_rework_envelopes(current_quality, current_review, brands)
+    while envelopes:
+        analysis_envelopes, write_envelopes = partition_rework_envelopes(envelopes)
+        for env in write_envelopes:
+            write_feedback.extend(
+                x.get("reason", "") for x in env.issues if x.get("reason")
+            )
+            write_feedback.extend(env.payload.get("feedback", []))
+            write_feedback = list(dict.fromkeys(x for x in write_feedback if x))
+            yield _ev("message", {"id": _sid("m"), "kind": "writing_constraint", "expert": auditor,
+                                  "reason": "报告表达类问题已保存为写作约束，将直接进入 write 执行。",
+                                  "envelope": {"sender": env.sender, "receiver": env.receiver,
+                                               "task_type": env.task_type, "issues": env.issues}})
+
+        if not analysis_envelopes:
+            current_review = accept_write_constraints(current_review)
+            envelopes = []
+            break
+        if rework_rounds_done >= max_rework_rounds:
+            break
+
+        for env in analysis_envelopes:
+            if env.receiver == "collect":
+                recollect_brands = env.payload.get("brands", [])
+                yield _ev("node_update", {"node": "audit", "status": "rework"})
+                yield _ev("node_update", {"node": "collect", "status": "rework"})
+                yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
+                                      "reason": f"证据不足，打回采集补充：{('、'.join(recollect_brands)) or '相关品牌'}",
+                                      "envelope": {"sender": env.sender, "receiver": env.receiver,
+                                                   "task_type": env.task_type, "issues": env.issues}})
+                # 用更多角度补采（追加最新动态角度）
+                collect_feedback = " ".join(
+                    [x.get("reason", "") for x in env.issues if x.get("reason")] +
+                    list(env.payload.get("feedback", []))
+                )
+                feedback_angles = ["第三方评测", "独立来源", "用户口碑", "市场数据"]
+                if any(word in collect_feedback for word in ("舆情", "声量", "情感")):
+                    feedback_angles.extend(["社区讨论", "用户评价"])
+                extra_angles = angles + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
+                for b in recollect_brands[:3]:
+                    trace.set_context(task_id, collector, "collect", f"返工补采「{b}」")
+                    res = await asyncio.to_thread(_collect_brand, b, extra_angles[:cfg["max_angles"]],
+                                                  collector, cfg["fetch_per_brand"], cfg["freshness"], seen_urls)
                     for e in _drain_trace():
                         yield e
-                    claims = analysis["claims"]
-                    structured = await asyncio.to_thread(_analyze_structured, query, brands, focus, evidences,
-                                                         cfg["structured_max_tokens"])
-                    analysis["structured"] = structured
-                    yield _ev("node_update", {"node": "analyze", "status": "done"})
-                elif env.receiver == "write":
-                    yield _ev("node_update", {"node": "audit", "status": "rework"})
-                    write_feedback.extend(
-                        x.get("reason", "") for x in env.issues if x.get("reason")
+                    for ev in res["evidences"]:
+                        evidences.append(ev)
+                        ev_by_collector[collector] += 1
+                        d = ev.to_dict()
+                        d["domain"] = domain_of(ev.source_url)
+                        d["brand"] = ev.brand
+                        d["full_text"] = getattr(ev, "_full_text", "")
+                        yield _ev("evidence", {**d})
+                    for fig in res["images"]:
+                        images.append(fig)
+                        yield _ev("image", fig)
+                yield _ev("node_update", {"node": "collect", "status": "done"})
+            elif env.receiver == "analyze":
+                follows_collect = env.payload.get("source") == "collect_rework"
+                analyze_reason = (
+                    "补采完成，重新分析以确保新增证据进入论点和结构化知识。"
+                    if follows_collect else
+                    "维度/结构覆盖不足，打回重新分析补全。"
+                )
+                yield _ev("node_update", {"node": "audit", "status": "rework"})
+                yield _ev("node_update", {"node": "analyze", "status": "rework"})
+                yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
+                                      "reason": analyze_reason,
+                                      "envelope": {"sender": env.sender, "receiver": env.receiver,
+                                                   "task_type": env.task_type, "issues": env.issues}})
+                trace.set_context(
+                    task_id, analyst, "analyze",
+                    "返工：补采后消费新增证据并更新分析产物" if follows_collect
+                    else "返工：按质检意见针对性补全维度与交叉验证",
+                )
+                rework_fb = "\n".join(
+                    f"- 问题：{x.get('reason', '')}" for x in env.issues[:8]
+                    if x.get("reason")
+                )
+                if env.payload.get("feedback"):
+                    rework_fb += "\n" + "\n".join(
+                        f"- 建议：{x}" for x in env.payload.get("feedback", [])[:8]
                     )
-                    write_feedback.extend(env.payload.get("feedback", []))
-                    write_feedback = list(dict.fromkeys(x for x in write_feedback if x))
-                    yield _ev("message", {"id": _sid("m"), "kind": "rework", "expert": auditor,
-                                          "reason": "报告表达类问题已路由至 write，后续章节将按反馈重写。",
-                                          "envelope": {"sender": env.sender, "receiver": env.receiver,
-                                                       "task_type": env.task_type, "issues": env.issues}})
-            rework_rounds_done += 1
-            current_quality = evaluate_quality(brands, focus, claims, evidences, structured)
-            trace.set_context(task_id, auditor, "audit", "返工后重新执行 LLM 复审")
-            current_review = await asyncio.to_thread(
-                llm_quality_review, query, brands, focus, claims, structured, current_quality, _model("aux"))
-            for e in _drain_trace():
-                yield e
-            audit_rounds.append({"round": rework_rounds_done, "quality": current_quality.to_dict(),
-                                 "llm_review": current_review,
-                                 "passed": quality_gate_passed(current_quality, current_review)})
-            yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
-                                  "stage": f"round_{rework_rounds_done}", "round": rework_rounds_done,
-                                  "verdict": current_review.get("verdict"),
-                                  "scores": current_review.get("scores", {}),
-                                  "review": current_review.get("review", ""),
-                                  "issues": current_review.get("issues", []),
-                                  "suggestions": current_review.get("suggestions", []),
-                                  "advisories": current_review.get("advisories", []),
-                                  "issue_routes": current_review.get("issue_routes", []),
-                                  "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
-            issues_resolved = max(issues_resolved,
-                                  max(0, len(quality_before.issues) - len(current_quality.issues)))
-            if quality_gate_passed(current_quality, current_review):
-                envelopes = []
-            else:
-                envelopes = build_rework_envelopes(current_quality, current_review, brands)
-        quality_after = current_quality
-    else:
-        quality_after = quality_before
+                analysis = await asyncio.to_thread(_analyze, query, brands, focus, evidences, member_ids,
+                                                   cfg["analyze_max_tokens"], rework_fb)
+                for e in _drain_trace():
+                    yield e
+                claims = analysis["claims"]
+                structured = await asyncio.to_thread(_analyze_structured, query, brands, focus, evidences,
+                                                     cfg["structured_max_tokens"])
+                analysis["structured"] = structured
+                yield _ev("node_update", {"node": "analyze", "status": "done"})
+        rework_rounds_done += 1
+        current_quality = evaluate_quality(brands, focus, claims, evidences, structured)
+        trace.set_context(task_id, auditor, "audit", "返工后重新执行 LLM 复审")
+        current_review = await asyncio.to_thread(
+            llm_quality_review, query, brands, focus, claims, structured, current_quality, _model("aux"))
+        for e in _drain_trace():
+            yield e
+        audit_rounds.append({"round": rework_rounds_done, "quality": current_quality.to_dict(),
+                             "llm_review": current_review,
+                             "passed": quality_gate_passed(current_quality, current_review)})
+        yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
+                              "stage": f"round_{rework_rounds_done}", "round": rework_rounds_done,
+                              "verdict": current_review.get("verdict"),
+                              "scores": current_review.get("scores", {}),
+                              "review": current_review.get("review", ""),
+                              "issues": current_review.get("issues", []),
+                              "suggestions": current_review.get("suggestions", []),
+                              "advisories": current_review.get("advisories", []),
+                              "issue_routes": current_review.get("issue_routes", []),
+                              "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
+        issues_resolved = max(issues_resolved,
+                              max(0, len(quality_before.issues) - len(current_quality.issues)))
+        if quality_gate_passed(current_quality, current_review):
+            envelopes = []
+        else:
+            envelopes = build_rework_envelopes(current_quality, current_review, brands)
+    quality_after = current_quality
 
     review_after = current_review
     if rework_rounds_done > 0:
@@ -1069,6 +1109,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "rework_rounds": rework_rounds_done,
                               "max_rework_rounds": max_rework_rounds,
                               "issues_resolved": issues_resolved,
+                              "writing_constraints": write_feedback,
                               "passed_quality_gate": passed_quality_gate,
                               "rework_exhausted": rework_exhausted}
     db.save_report(report, task_id=task_id)

@@ -8,8 +8,9 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
   const before = review.before
   const after = review.after
   const hasRework = (review.rework_rounds ?? 0) > 0 && after && after !== before
+  const hasWritingConstraints = (review.writing_constraints?.length ?? 0) > 0
   // 主展示用复审结果（若有返工），否则用初审
-  const main: AuditOpinion = (hasRework ? after : before) || {}
+  const main: AuditOpinion = (hasRework || hasWritingConstraints ? after : before) || {}
   const scoreKeys = Object.keys(main.scores ?? {})
   const verdictPass = review.passed_quality_gate ?? main.verdict !== 'rework'
 
@@ -127,6 +128,22 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
           </div>
           <ul className="mt-2 space-y-1.5">
             {main.advisories.map((it, i) => (
+              <li key={i} className="flex gap-2 text-tag leading-relaxed text-ink-2">
+                <CheckCircle2 size={13} className="mt-0.5 shrink-0 text-ok" />
+                <span>{it}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {hasWritingConstraints && (
+        <div className="mt-4">
+          <div className="flex items-center gap-1.5 text-tag font-semibold text-primary-deep">
+            <Lightbulb size={13} /> 已应用的写作约束（{review.writing_constraints!.length}）
+          </div>
+          <ul className="mt-2 space-y-1.5">
+            {review.writing_constraints!.map((it, i) => (
               <li key={i} className="flex gap-2 text-tag leading-relaxed text-ink-2">
                 <CheckCircle2 size={13} className="mt-0.5 shrink-0 text-ok" />
                 <span>{it}</span>
