@@ -29,7 +29,7 @@ from app.core import charts as C
 from app.core import db
 from app.core import trace
 from app.core.audit import (accept_write_constraints, build_rework_envelopes,
-                             evaluate_quality, llm_quality_review,
+                             evaluate_quality, llm_quality_review_with_evidence,
                              partition_rework_envelopes, quality_gate_passed)
 from app.core.config import get_settings
 from app.core.credibility import score_evidence, freshness_days
@@ -191,6 +191,7 @@ def _load_task_seed_evidences(task_id: str) -> List[Evidence]:
             captured_at=item.get("captured_at", ""),
             credibility=float(item.get("credibility") or 0),
             collected_by=item.get("collected_by", "monitor-agent"),
+            review_text=item.get("review_text", ""),
             brand=item.get("brand", ""),
             domain=item.get("domain", ""),
             snapshot_id=item.get("snapshot_id", ""),
@@ -202,6 +203,7 @@ def _load_task_seed_evidences(task_id: str) -> List[Evidence]:
                 full_text = read_snapshot(item["snapshot_path"])
             except (OSError, ValueError):
                 pass
+        evidence.review_text = (evidence.review_text or full_text)[:4000]
         evidence._full_text = full_text[:6000]  # type: ignore[attr-defined]
         output.append(evidence)
     return output
@@ -595,11 +597,13 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
             captured_at=pub_date or captured,
             credibility=cred,
             collected_by=collector,
+            review_text=text[:4000],
             image_urls=[im["src"] for im in page.get("images", [])][:3],
             brand=brand,
             domain=domain_of(url),
             freshness_days=fdays,
         )
+        ev.review_text = text[:4000]
         ev._full_text = text[:1500]  # type: ignore[attr-defined]
         out_ev.append(ev)
         # 配图
@@ -753,6 +757,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             d["domain"] = domain_of(ev.source_url)
             d["brand"] = ev.brand
             d["full_text"] = getattr(ev, "_full_text", "")
+            d.pop("review_text", None)
             yield _ev("evidence", {**d})
             yield _ev("progress", prog(min(14 + len(evidences), 50), "collect", len(evidences)))
             await asyncio.sleep(0.01)
@@ -832,13 +837,14 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                     evidence_id=_sid("e"), source_url=url, source_type=detected,
                     title=title or f"{sb} 口碑", excerpt=text[:280],
                     captured_at=pub or _now(), credibility=cred, collected_by=sentiment_expert,
-                    brand=sb, domain=domain_of(url),
+                    review_text=text[:4000], brand=sb, domain=domain_of(url),
                 )
                 evidences.append(ev)
                 ev_by_collector[sentiment_expert] += 1
                 d = ev.to_dict()
                 d["domain"] = domain_of(url)
                 d["brand"] = sb
+                d.pop("review_text", None)
                 yield _ev("evidence", {**d})
         kept = len([c for c in sentiment_comments if c['brand'] == sb])
         yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": sentiment_expert,
@@ -899,7 +905,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     # 质检官 LLM 真实审阅（逐维度打分 + 问题 + 改进建议）——让质检有对比、有审阅、可观测
     trace.set_context(task_id, auditor, "audit", "质检官审阅：逐维度打分+问题+改进建议")
     review_before = await asyncio.to_thread(
-        llm_quality_review, query, brands, focus, claims, structured, quality_before, _model("aux"))
+        llm_quality_review_with_evidence, query, brands, focus, claims, structured, quality_before,
+        _model("aux"), evidences=evidences)
     for e in _drain_trace():
         yield e
     yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
@@ -910,7 +917,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "issues": review_before.get("issues", []),
                           "suggestions": review_before.get("suggestions", []),
                           "advisories": review_before.get("advisories", []),
-                          "issue_routes": review_before.get("issue_routes", [])})
+                          "semantic_issues": review_before.get("semantic_issues", review_before.get("issues", [])),
+                          "review_validation_errors": review_before.get("review_validation_errors", []),
+                          "rule_issues": quality_before.to_dict().get("rule_issues", []),
+                          "issue_routes": review_before.get("issue_routes", []),
+                          "claim_evidence_reviews": review_before.get("claim_evidence_reviews", []),
+                          "review_context_stats": review_before.get("review_context_stats", {})})
     current_quality = quality_before
     current_review = review_before
     audit_rounds: List[Dict[str, Any]] = []
@@ -970,6 +982,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                         d["domain"] = domain_of(ev.source_url)
                         d["brand"] = ev.brand
                         d["full_text"] = getattr(ev, "_full_text", "")
+                        d.pop("review_text", None)
                         yield _ev("evidence", {**d})
                     for fig in res["images"]:
                         images.append(fig)
@@ -1014,7 +1027,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         current_quality = evaluate_quality(brands, focus, claims, evidences, structured)
         trace.set_context(task_id, auditor, "audit", "返工后重新执行 LLM 复审")
         current_review = await asyncio.to_thread(
-            llm_quality_review, query, brands, focus, claims, structured, current_quality, _model("aux"))
+            llm_quality_review_with_evidence, query, brands, focus, claims, structured, current_quality,
+            _model("aux"), evidences=evidences)
         for e in _drain_trace():
             yield e
         audit_rounds.append({"round": rework_rounds_done, "quality": current_quality.to_dict(),
@@ -1028,7 +1042,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "issues": current_review.get("issues", []),
                               "suggestions": current_review.get("suggestions", []),
                               "advisories": current_review.get("advisories", []),
+                              "semantic_issues": current_review.get("semantic_issues", current_review.get("issues", [])),
+                              "review_validation_errors": current_review.get("review_validation_errors", []),
+                              "rule_issues": current_quality.to_dict().get("rule_issues", []),
                               "issue_routes": current_review.get("issue_routes", []),
+                              "claim_evidence_reviews": current_review.get("claim_evidence_reviews", []),
+                              "review_context_stats": current_review.get("review_context_stats", {}),
                               "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
         issues_resolved = max(issues_resolved,
                               max(0, len(quality_before.issues) - len(current_quality.issues)))
@@ -2036,6 +2055,7 @@ def _assemble_report(query, brands, focus, dispatch, claims, evidences, images,
         "subtitle": subtitle,
         "query": query,
         "brands": brands,
+        "focus": focus,
         "mode": mode,
         "created_at": _now(),
         "experts": members,

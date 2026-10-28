@@ -216,12 +216,40 @@ export interface AuditOpinion {
   scores?: Record<string, number>
   review?: string
   issues?: string[]
+  semantic_issues?: string[]
+  review_validation_errors?: string[]
+  rule_issues?: { issue_id?: string; target?: string; rule_type?: string; severity?: string; reason?: string }[]
   suggestions?: string[]
   advisories?: string[]
   issue_routes?: { category: 'collect' | 'analyze' | 'write'; issue: string; suggestion?: string }[]
+  claim_evidence_reviews?: ClaimEvidenceReview[]
+  review_context_stats?: {
+    claims_total?: number
+    evidence_attached?: number
+    evidence_links_attached?: number
+    unreviewed_claims?: number
+    truncated_evidences?: number
+    excerpt_only_evidences?: number
+    batch_count?: number
+  }
   review_failed?: boolean
+  review_valid?: boolean
   writing_constraints?: string[]
   write_constraints_deferred?: boolean
+}
+
+export interface ClaimEvidenceReview {
+  claim_id: string
+  claim?: string
+  verdict?: string
+  issue?: string
+  suggestion?: string
+  evidence_assessments?: {
+    evidence_id: string
+    verdict?: string
+    reason?: string
+    support_quote?: string
+  }[]
 }
 
 export interface AuditReview {

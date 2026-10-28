@@ -86,6 +86,24 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
         </p>
       )}
 
+      {main.review_validation_errors && main.review_validation_errors.length > 0 && (
+        <div className="mt-4 rounded-card border border-risk/30 bg-risk/10 p-3 text-tag text-risk">
+          复审输出校验未通过，系统已在复审环节重试；这些协议错误不会被路由为采集或分析返工。
+          <ul className="mt-2 space-y-1">
+            {main.review_validation_errors.map((error, index) => <li key={index}>{error}</li>)}
+          </ul>
+        </div>
+      )}
+
+      {main.rule_issues && main.rule_issues.length > 0 && (
+        <div className="mt-4 rounded-card border border-risk/30 bg-risk/10 p-3 text-tag text-risk">
+          规则质检问题（{main.rule_issues.length}）
+          <ul className="mt-2 space-y-1">
+            {main.rule_issues.map((issue, index) => <li key={issue.issue_id ?? index}>{issue.reason ?? issue.target}</li>)}
+          </ul>
+        </div>
+      )}
+
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
         {/* 发现的问题 */}
         {main.issues && main.issues.length > 0 && (
@@ -134,6 +152,32 @@ export function VAuditReview({ review }: { review?: AuditReview }) {
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {main.claim_evidence_reviews && main.claim_evidence_reviews.length > 0 && (
+        <div className="mt-4">
+          <div className="flex items-center gap-1.5 text-tag font-semibold text-ink-2">
+            <ShieldCheck size={13} /> Claim-Evidence 语义复审（{main.claim_evidence_reviews.length}）
+          </div>
+          <div className="mt-2 space-y-2">
+            {main.claim_evidence_reviews.map((item) => {
+              const verdict = item.verdict ?? 'unreviewed'
+              const passed = verdict === 'supported'
+              return (
+                <div key={item.claim_id} className="rounded-card border border-line/60 bg-bg p-3 text-tag">
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-ink-2">{item.claim_id}: {item.claim ?? 'Claim'}</span>
+                    <span className={passed ? 'shrink-0 text-ok' : 'shrink-0 text-risk'}>{verdict}</span>
+                  </div>
+                  <div className="mt-1 text-ink-3">
+                    Evidence: {(item.evidence_assessments ?? []).map((e) => `${e.evidence_id} (${e.verdict ?? 'unreviewed'})`).join(', ') || 'none'}
+                  </div>
+                  {item.issue && <div className="mt-1 text-risk">{item.issue}</div>}
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
 

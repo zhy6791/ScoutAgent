@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.core import db
+from app.core.audit import QualityReport, llm_quality_review_with_evidence
 from app.core.config import get_settings
 from app.core.llm import LLMNotConfigured, chat
 from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section
@@ -193,6 +194,38 @@ def get_report(report_id: str):
     if not rep:
         return {"ok": False, "message": "report not ready"}
     return rep
+
+
+class SemanticReviewReplayBody(BaseModel):
+    persist: bool = False
+
+
+@app.post("/api/reports/{report_id}/semantic-review-replay")
+def replay_report_semantic_review(report_id: str, body: SemanticReviewReplayBody):
+    """Re-run claim-evidence semantic review; persist only when explicitly requested."""
+    rep = db.get_report(report_id)
+    if not rep:
+        return {"ok": False, "message": "report not found"}
+    quality_data = rep.get("quality_after") or {}
+    qr = QualityReport(
+        coverage_by_dimension=quality_data.get("coverage_by_dimension", {}),
+        coverage_by_brand=quality_data.get("coverage_by_brand", {}),
+        confidence_ratio=float(quality_data.get("confidence_ratio", 0) or 0),
+        schema_completeness=float(quality_data.get("schema_completeness", 0) or 0),
+        dimension_coverage_rate=float(quality_data.get("dimension_coverage_rate", 0) or 0),
+        brand_coverage_rate=float(quality_data.get("brand_coverage_rate", 0) or 0),
+        issues=quality_data.get("issues", []) or [],
+    )
+    review = llm_quality_review_with_evidence(
+        rep.get("query", ""), rep.get("brands", []) or [], rep.get("focus", []) or [],
+        rep.get("claims", []) or [], rep.get("structured", {}) or {}, qr,
+        settings.zhipu_model_aux, evidences=rep.get("evidence", []) or [],
+    )
+    if body.persist:
+        audit_review = rep.setdefault("audit_review", {})
+        audit_review["historical_semantic_review"] = review
+        db.save_report(rep, task_id="")
+    return {"ok": True, "report_id": report_id, "persisted": body.persist, "review": review}
 
 
 # ── 可观测性 Trace（决策链路 / 决策回放）──────────────────

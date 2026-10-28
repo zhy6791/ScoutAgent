@@ -202,6 +202,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    try:
+        conn.execute("ALTER TABLE evidences ADD COLUMN review_text TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     _record_migration(conn, 1, "baseline")
     _apply_migration(conn, 2, "subscription_monitor_columns", _migration_v2)
@@ -547,12 +551,13 @@ def save_report(report: Dict[str, Any], task_id: str = "") -> None:
         for ev in evidence:
             c.execute(
                 "INSERT OR REPLACE INTO evidences(evidence_id,report_id,source_url,source_type,"
-                "domain,title,excerpt,credibility,collected_by,brand,captured_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "domain,title,excerpt,review_text,credibility,collected_by,brand,captured_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ev.get("evidence_id"), report["id"], ev.get("source_url", ""),
                     ev.get("source_type", ""), ev.get("domain", ""), ev.get("title", ""),
-                    ev.get("excerpt", "")[:500], ev.get("credibility", 0.0),
+                    ev.get("excerpt", "")[:500], ev.get("review_text", "")[:4000],
+                    ev.get("credibility", 0.0),
                     ev.get("collected_by", ""), ev.get("brand", ""), ev.get("captured_at", _now()),
                 ),
             )

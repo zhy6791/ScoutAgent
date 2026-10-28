@@ -7,14 +7,175 @@ from app.core.audit import (
     build_rework_envelopes,
     classify_review_issue,
     llm_quality_review,
+    llm_quality_review_with_evidence,
+    build_claim_evidence_review_context,
+    normalize_claim_evidence_reviews,
+    evaluate_quality,
     normalize_issue_routes,
     partition_rework_envelopes,
     quality_gate_passed,
 )
+from app.core.models import Evidence
 from app.core.orchestrator import MODE_CONFIG
 
 
 class QualityGateTests(unittest.TestCase):
+    def test_rule_quality_checks_claim_evidence_integrity(self):
+        evidence = Evidence(
+            evidence_id="e_cursor", source_url="https://cursor.example", source_type="official",
+            title="Cursor", excerpt="Cursor source", captured_at="2026-10-28", credibility=80,
+            collected_by="L1-001", brand="Cursor",
+        )
+        quality = evaluate_quality(
+            ["Trae", "Cursor"], [], [
+                {"claim_id": "c_missing", "text": "Trae is a product", "evidence_ids": ["e_fake"]},
+                {"claim_id": "c_empty", "text": "Trae capability", "evidence_ids": []},
+            ], [evidence], {},
+        )
+        rule_types = {issue.get("rule_type") for issue in quality.rule_issues}
+
+        self.assertIn("evidence_id_missing", rule_types)
+        self.assertIn("brand_mismatch", rule_types)
+        self.assertIn("claim_no_evidence", rule_types)
+        self.assertEqual(quality.to_dict()["rule_issues"], quality.issues)
+
+    def test_review_context_attaches_only_claim_linked_evidence_content(self):
+        evidence = Evidence(
+            evidence_id="e_1", source_url="https://example.com/source", source_type="official",
+            title="Source title", excerpt="Short excerpt", captured_at="2026-10-28",
+            credibility=90, collected_by="L1-001", review_text="Full review text", brand="A",
+        )
+        contexts, stats = build_claim_evidence_review_context([
+            {"claim_id": "c_1", "text": "Claim", "evidence_ids": ["e_1", "e_missing"]}
+        ], [evidence])
+
+        self.assertEqual(contexts[0]["evidences"][0]["review_text"], "Full review text")
+        self.assertEqual(contexts[0]["evidences"][0]["evidence_id"], "e_1")
+        self.assertEqual(contexts[0]["missing_evidence_ids"], ["e_missing"])
+        self.assertEqual(stats["evidence_attached"], 1)
+
+    def test_claim_review_rejects_unknown_evidence_and_conflicting_verdict(self):
+        contexts = [{
+            "claim_id": "c_1", "claim": "Claim", "confidence": "medium",
+            "evidence_ids": ["e_1"], "evidences": [{"evidence_id": "e_1", "brand": "A"}],
+        }]
+        reviews, blockers = normalize_claim_evidence_reviews([{
+            "claim_id": "c_1", "verdict": "supported",
+            "evidence_assessments": [
+                {"evidence_id": "e_fake", "verdict": "supports"},
+                {"evidence_id": "e_1", "verdict": "unrelated"},
+            ],
+        }], contexts)
+
+        self.assertEqual(reviews[0]["evidence_assessments"], [{
+            "evidence_id": "e_1", "verdict": "unrelated", "reason": "", "support_quote": "",
+        }])
+        self.assertEqual(reviews[0]["verdict"], "unrelated")
+        self.assertEqual(blockers[0]["category"], "collect")
+
+    def test_claim_review_route_preserves_claim_and_evidence_context(self):
+        contexts = [{
+            "claim_id": "c_1", "claim": "Claim", "confidence": "high",
+            "evidence_ids": ["e_1"], "evidences": [{"evidence_id": "e_1", "brand": "A"}],
+        }]
+        _, blockers = normalize_claim_evidence_reviews([{
+            "claim_id": "c_1", "verdict": "insufficient",
+            "evidence_assessments": [{"evidence_id": "e_1", "verdict": "unrelated"}],
+        }], contexts)
+        self.assertEqual(blockers[0]["claim_id"], "c_1")
+        self.assertEqual(blockers[0]["evidence_ids"], ["e_1"])
+
+    @patch("app.core.llm.chat_json")
+    def test_missing_claim_review_fails_closed(self, mock_chat_json):
+        mock_chat_json.return_value = {"scores": {}, "claim_reviews": [], "advisories": []}
+        evidence = Evidence(
+            evidence_id="e_1", source_url="https://example.com", source_type="official",
+            title="Title", excerpt="Excerpt", captured_at="2026-10-28", credibility=80,
+            collected_by="L1-001", review_text="Supporting text", brand="A",
+        )
+        review = llm_quality_review_with_evidence(
+            "topic", ["A"], [], [{"claim_id": "c_1", "text": "Claim", "evidence_ids": ["e_1"]}],
+            {}, QualityReport(), evidences=[evidence],
+        )
+
+        self.assertEqual(review["verdict"], "rework")
+        self.assertEqual(review["claim_evidence_reviews"], [])
+        self.assertTrue(review["review_validation_errors"])
+        self.assertEqual(review["review_context_stats"]["unreviewed_claims"], 0)
+
+    @patch("app.core.llm.chat_json")
+    def test_invalid_review_is_retried_and_does_not_route_to_analysis(self, mock_chat_json):
+        mock_chat_json.side_effect = [
+            {"claim_reviews": [{"claim_id": "forged", "verdict": "supported", "evidence_assessments": []}]},
+            {"claim_reviews": [{
+                "claim_id": "c_1", "verdict": "supported",
+                "evidence_assessments": [{"evidence_id": "e_1", "verdict": "supports"}],
+            }], "blocking_issues": [], "advisories": [], "scores": {}, "review": "ok"},
+        ]
+        evidence = Evidence(
+            evidence_id="e_1", source_url="https://example.com", source_type="official",
+            title="Title", excerpt="Excerpt", captured_at="2026-10-28", credibility=80,
+            collected_by="L1-001", review_text="Supporting text", brand="A",
+        )
+        review = llm_quality_review_with_evidence(
+            "topic", ["A"], [], [{"claim_id": "c_1", "text": "Claim", "evidence_ids": ["e_1"]}],
+            {}, QualityReport(), evidences=[evidence],
+        )
+
+        self.assertEqual(mock_chat_json.call_count, 2)
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(review["review_validation_errors"], [])
+
+    @patch("app.core.llm.chat_json", return_value={
+        "claim_reviews": [{"claim_id": "forged", "verdict": "supported", "evidence_assessments": []}],
+    })
+    def test_exhausted_validation_errors_do_not_trigger_rework_routes(self, mock_chat_json):
+        evidence = Evidence(
+            evidence_id="e_1", source_url="https://example.com", source_type="official",
+            title="Title", excerpt="Excerpt", captured_at="2026-10-28", credibility=80,
+            collected_by="L1-001", review_text="Supporting text", brand="A",
+        )
+        review = llm_quality_review_with_evidence(
+            "topic", ["A"], [], [{"claim_id": "c_1", "text": "Claim", "evidence_ids": ["e_1"]}],
+            {}, QualityReport(), evidences=[evidence],
+        )
+        envelopes = build_rework_envelopes(QualityReport(), review, ["A"])
+
+        self.assertEqual(mock_chat_json.call_count, 2)
+        self.assertTrue(review["review_validation_errors"])
+        self.assertEqual(review["semantic_issues"], [])
+        self.assertEqual(envelopes, [])
+        self.assertFalse(quality_gate_passed(QualityReport(), review))
+
+    @patch("app.core.llm.chat_json")
+    def test_supported_claim_requires_each_attached_evidence_assessment(self, mock_chat_json):
+        mock_chat_json.return_value = {
+            "scores": {"evidence": 90},
+            "claim_reviews": [{
+                "claim_id": "c_1", "verdict": "supported", "importance": "core",
+                "evidence_assessments": [{
+                    "evidence_id": "e_1", "verdict": "supports",
+                    "reason": "The source states the claimed capability.",
+                    "support_quote": "claimed capability",
+                }],
+            }],
+            "blocking_issues": [], "advisories": [],
+        }
+        evidence = Evidence(
+            evidence_id="e_1", source_url="https://example.com", source_type="official",
+            title="Title", excerpt="Excerpt", captured_at="2026-10-28", credibility=80,
+            collected_by="L1-001", review_text="The source states the claimed capability.", brand="A",
+        )
+        review = llm_quality_review_with_evidence(
+            "topic", ["A"], [], [{"claim_id": "c_1", "text": "Claim", "confidence": "medium", "evidence_ids": ["e_1"]}],
+            {}, QualityReport(), evidences=[evidence],
+        )
+
+        self.assertEqual(review["verdict"], "pass")
+        self.assertEqual(review["claim_evidence_reviews"][0]["verdict"], "supported")
+        prompt = mock_chat_json.call_args.args[0][1]["content"]
+        self.assertIn("The source states the claimed capability.", prompt)
+
     def test_gate_requires_rules_and_llm_to_pass(self):
         clean = QualityReport()
         passing_review = {"verdict": "pass", "issues": []}

@@ -18,6 +18,8 @@ class Evidence:
     captured_at: str
     credibility: float  # 0-100 整数（由 credibility.score_evidence 计算，精确到个位、有差异）
     collected_by: str
+    # Bounded source text used by claim-level semantic review.
+    review_text: str = ""
     screenshot_path: str = ""
     image_urls: List[str] = field(default_factory=list)
     lang: str = "zh"

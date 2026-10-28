@@ -1,0 +1,70 @@
+[
+  {
+    "name": "supported",
+    "context": {
+      "claim_id": "c_supported",
+      "claim": "The product supports shared workspaces.",
+      "confidence": "medium",
+      "evidence_ids": ["e_supported"],
+      "evidences": [{"evidence_id": "e_supported", "brand": "Product A"}]
+    },
+    "model_review": {
+      "claim_id": "c_supported",
+      "verdict": "supported",
+      "evidence_assessments": [{"evidence_id": "e_supported", "verdict": "supports", "reason": "The source states shared workspaces."}]
+    },
+    "expected_verdict": "supported",
+    "expected_blocking": false
+  },
+  {
+    "name": "unrelated",
+    "context": {
+      "claim_id": "c_unrelated",
+      "claim": "The product supports shared workspaces.",
+      "confidence": "medium",
+      "evidence_ids": ["e_unrelated"],
+      "evidences": [{"evidence_id": "e_unrelated", "brand": "Product A"}]
+    },
+    "model_review": {
+      "claim_id": "c_unrelated",
+      "verdict": "supported",
+      "evidence_assessments": [{"evidence_id": "e_unrelated", "verdict": "unrelated", "reason": "The source discusses pricing only."}]
+    },
+    "expected_verdict": "unrelated",
+    "expected_blocking": true
+  },
+  {
+    "name": "contradicted",
+    "context": {
+      "claim_id": "c_contradicted",
+      "claim": "The product is free for all users.",
+      "confidence": "high",
+      "evidence_ids": ["e_contradicted"],
+      "evidences": [{"evidence_id": "e_contradicted", "brand": "Product A"}]
+    },
+    "model_review": {
+      "claim_id": "c_contradicted",
+      "verdict": "supported",
+      "evidence_assessments": [{"evidence_id": "e_contradicted", "verdict": "contradicts", "reason": "The source lists a paid plan."}]
+    },
+    "expected_verdict": "contradicted",
+    "expected_blocking": true
+  },
+  {
+    "name": "insufficient",
+    "context": {
+      "claim_id": "c_insufficient",
+      "claim": "The product has 10 million users.",
+      "confidence": "high",
+      "evidence_ids": [],
+      "evidences": []
+    },
+    "model_review": {
+      "claim_id": "c_insufficient",
+      "verdict": "supported",
+      "evidence_assessments": []
+    },
+    "expected_verdict": "insufficient",
+    "expected_blocking": false
+  }
+]
