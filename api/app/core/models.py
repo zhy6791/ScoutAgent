@@ -24,6 +24,8 @@ class Evidence:
     brand: str = ""
     domain: str = ""
     freshness_days: Optional[int] = None  # 距今天数，None=无法解析
+    snapshot_id: str = ""
+    change_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,6 +66,123 @@ class Envelope:
     payload: Dict[str, Any] = field(default_factory=dict)
     issues: List[Dict[str, Any]] = field(default_factory=list)
     trace_ref: str = ""
+
+
+@dataclass
+class Subscription:
+    sub_id: str
+    query: str
+    brands: List[str] = field(default_factory=list)
+    enabled: bool = False
+    schedule_type: str = "interval"
+    schedule_config: Dict[str, Any] = field(default_factory=dict)
+    timezone: str = "Asia/Shanghai"
+    next_run_at: str = ""
+    last_run_at: str = ""
+    last_report_id: str = ""
+    run_count: int = 0
+    last_checked_at: str = ""
+    last_success_at: str = ""
+    last_status: str = "needs_configuration"
+    consecutive_failures: int = 0
+    monitor_error: str = ""
+    lease_owner: str = ""
+    lease_expires_at: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SubscriptionTarget:
+    target_id: str
+    sub_id: str
+    brand: str
+    target_type: str
+    url: str
+    enabled: bool = True
+    last_snapshot_id: str = ""
+    last_hash: str = ""
+    last_checked_at: str = ""
+    failure_count: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class MonitorRun:
+    run_id: str
+    sub_id: str
+    trigger_type: str
+    scheduled_at: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    status: str = "pending"
+    target_count: int = 0
+    success_count: int = 0
+    changed_count: int = 0
+    search_calls: int = 0
+    llm_tokens: int = 0
+    duration_ms: int = 0
+    not_modified_count: int = 0
+    minor_change_count: int = 0
+    llm_failure_count: int = 0
+    error: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PageSnapshot:
+    snapshot_id: str
+    run_id: str
+    target_id: str
+    source_url: str
+    previous_snapshot_id: str = ""
+    final_url: str = ""
+    http_status: int = 0
+    content_hash: str = ""
+    content_length: int = 0
+    content_excerpt: str = ""
+    snapshot_path: str = ""
+    etag: str = ""
+    last_modified: str = ""
+    captured_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CompetitorChange:
+    change_id: str
+    sub_id: str
+    run_id: str
+    target_id: str
+    previous_snapshot_id: str
+    current_snapshot_id: str
+    change_type: str = "unknown"
+    severity: str = "info"
+    material: bool = False
+    change_ratio: float = 0.0
+    diff_summary: str = ""
+    before_excerpt: str = ""
+    after_excerpt: str = ""
+    llm_status: str = "skipped"
+    status: str = "new"
+    research_task_id: str = ""
+    research_report_id: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 def make_claim(

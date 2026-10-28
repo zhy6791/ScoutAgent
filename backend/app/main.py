@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, Request
@@ -19,11 +20,29 @@ from app.core.config import get_settings
 from app.core.llm import LLMNotConfigured, chat
 from app.core.orchestrator import create_task, run_pipeline, submit_clarify, refine_section
 from app.core.search import search
+from app.core.subscription_api import router as subscription_router
 from app.data import expert_by_id, load_experts
 
 settings = get_settings()
 
-app = FastAPI(title="青野 Verda API", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    scheduler = None
+    if settings.subscription_scheduler_active:
+        from app.core.subscription_scheduler import get_subscription_scheduler
+
+        scheduler = get_subscription_scheduler()
+        scheduler.start()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            await scheduler.shutdown()
+        db.close_all_connections()
+
+
+app = FastAPI(title="青野 Verda API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +51,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(subscription_router)
 
 
 # ── 基础 / 健康 ─────────────────────────────────────────
@@ -240,25 +260,4 @@ def evidences(
     return {"items": items, "facets": db.evidence_facets()}
 
 
-# ── 竞品监控订阅 ────────────────────────────────────────
-class SubscriptionBody(BaseModel):
-    query: str
-    brands: List[str] = []
-
-
-@app.get("/api/subscriptions")
-def list_subscriptions():
-    return db.list_subscriptions()
-
-
-@app.post("/api/subscriptions")
-def create_subscription(body: SubscriptionBody):
-    import uuid
-    sub_id = f"sub_{uuid.uuid4().hex[:8]}"
-    return db.create_subscription(sub_id, body.query, body.brands)
-
-
-@app.delete("/api/subscriptions/{sub_id}")
-def delete_subscription(sub_id: str):
-    db.delete_subscription(sub_id)
-    return {"ok": True}
+__all__ = ["app"]

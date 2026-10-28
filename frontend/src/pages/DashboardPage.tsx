@@ -2,13 +2,12 @@ import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
 import { useNavigate } from 'react-router-dom'
 import {
-  ShieldCheck, Database, FileText, Sparkles, Search, Bell, BellPlus,
-  Trash2, Users, ExternalLink, Layers, Activity, Radar, Crosshair,
+  ShieldCheck, Database, FileText, Sparkles, Search, Bell,
+  Users, ExternalLink, Layers, Activity, Radar, Crosshair,
   PieChart, TrendingUp, Target, Clock, Zap, Network, Gauge,
 } from 'lucide-react'
 import {
-  fetchDashboard, fetchEvidences, fetchSubscriptions,
-  createSubscription, deleteSubscription, fetchWorkload,
+  fetchDashboard, fetchEvidences, fetchSubscriptions, fetchWorkload,
 } from '../lib/api'
 import type {
   DashboardStats, EvidenceQueryResp, EvidenceRecord, Subscription, ExpertWorkload,
@@ -58,7 +57,6 @@ export default function DashboardPage() {
 
   const [brandFilter, setBrandFilter] = useState<string>('')
   const [typeFilter, setTypeFilter] = useState<string>('')
-  const [subQuery, setSubQuery] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -157,18 +155,6 @@ export default function DashboardPage() {
     () => (Array.isArray(workload) ? workload : []).filter((w) => w.missions > 0).slice(0, 6),
     [workload],
   )
-
-  const handleCreateSub = async () => {
-    const q = subQuery.trim()
-    if (!q) return
-    await createSubscription(q, [])
-    setSubQuery('')
-    setSubs(await fetchSubscriptions())
-  }
-  const handleDeleteSub = async (id: string) => {
-    await deleteSubscription(id)
-    setSubs(await fetchSubscriptions())
-  }
 
   const empty = !loading && (!stats || stats.reports === 0)
   const coveredBrands = brandIntel.length
@@ -429,46 +415,28 @@ export default function DashboardPage() {
                 <div className="flex items-center gap-2 text-aux font-semibold text-ink">
                   <Bell size={16} className="text-primary" /> 竞品持续追踪
                 </div>
-                <p className="mt-1 text-tag text-ink-3">订阅一个赛道，一键复跑获取最新动态</p>
-
-                <div className="mt-3 flex gap-2">
-                  <input
-                    value={subQuery}
-                    onChange={(e) => setSubQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleCreateSub()}
-                    placeholder="如：TikTok Shop 竞品监控"
-                    className="h-10 flex-1 rounded-btn border border-line bg-bg px-3 text-aux text-ink outline-none focus:border-primary-soft"
-                  />
-                  <button
-                    onClick={handleCreateSub}
-                    className="grid h-10 w-10 place-items-center rounded-btn bg-primary text-white hover:bg-primary-deep"
-                  >
-                    <BellPlus size={16} />
-                  </button>
-                </div>
-
                 <div className="mt-4 space-y-2">
                   {subs.length === 0 ? (
                     <div className="py-6 text-center text-tag text-ink-3">还没有追踪订阅</div>
-                  ) : subs.map((s) => (
-                    <div key={s.sub_id} className="rounded-card border border-line/60 bg-bg p-3">
+                  ) : subs.slice(0, 4).map((s) => (
+                    <button key={s.sub_id} onClick={() => navigate('/monitoring')}
+                      className="w-full rounded-card border border-line/60 bg-bg p-3 text-left hover:border-primary-soft">
                       <div className="flex items-start justify-between gap-2">
                         <div className="line-clamp-2 text-aux font-medium text-ink">{s.query}</div>
-                        <button onClick={() => handleDeleteSub(s.sub_id)}
-                          className="shrink-0 text-ink-3 hover:text-warn">
-                          <Trash2 size={14} />
-                        </button>
+                        {s.unread_change_count > 0 && <span className="rounded-chip bg-risk px-1.5 text-tag text-white">{s.unread_change_count}</span>}
                       </div>
                       <div className="mt-2 flex items-center gap-2 text-tag text-ink-3">
-                        <span>已复跑 {s.run_count} 次</span>
-                        {s.last_report_id && (
-                          <button onClick={() => navigate(`/report/${s.last_report_id}`)}
-                            className="text-primary-deep hover:underline">查看最近报告</button>
-                        )}
+                        <span>{s.enabled ? '运行中' : s.last_status === 'needs_configuration' ? '待配置' : '已暂停'}</span>
+                        <span>·</span>
+                        <span>{s.enabled_target_count} 个目标</span>
                       </div>
-                    </div>
+                    </button>
                   ))}
                 </div>
+                <button onClick={() => navigate('/monitoring')}
+                  className="mt-4 inline-flex h-9 items-center gap-1.5 rounded-btn bg-primary px-3 text-tag font-medium text-white hover:bg-primary-deep">
+                  管理监控 <ExternalLink size={13} />
+                </button>
               </VCard>
             </motion.div>
           </div>

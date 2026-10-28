@@ -8,6 +8,7 @@ import {
   Sprout,
   ChevronDown,
   Library,
+  BellRing,
 } from 'lucide-react'
 import { fetchDashboard } from '../lib/api'
 
@@ -17,6 +18,7 @@ const navItems = [
   { to: '/knowledge', label: '知识库', icon: Library },
   { to: '/experts', label: '专家公会', icon: Users },
   { to: '/dashboard', label: '竞争情报中心', icon: Radar },
+  { to: '/monitoring', label: '竞品监控', icon: BellRing },
 ]
 
 export default function VSidebar() {

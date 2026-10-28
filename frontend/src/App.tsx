@@ -12,6 +12,7 @@ import ExpertDetailPage from './pages/ExpertDetailPage'
 import LibraryPage from './pages/LibraryPage'
 import DashboardPage from './pages/DashboardPage'
 import KnowledgePage from './pages/KnowledgePage'
+import MonitoringPage from './pages/MonitoringPage'
 import { useExpertStore } from './store/expertStore'
 
 export default function App() {
@@ -31,6 +32,7 @@ export default function App() {
           <Route path="/experts" element={<ExpertsPage />} />
           <Route path="/experts/:id" element={<ExpertDetailPage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="/monitoring" element={<MonitoringPage />} />
         </Route>
 
         {/* 全屏沉浸页：澄清 / 工作台 / 报告 / 图谱 */}

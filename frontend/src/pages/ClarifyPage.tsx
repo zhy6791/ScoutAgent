@@ -10,6 +10,7 @@ import { fadeUp, stagger } from '../lib/motion'
 interface NavState {
   query?: string
   clarify?: ClarifyQuestion[]
+  answers?: Record<string, unknown>
 }
 
 export default function ClarifyPage() {
@@ -18,7 +19,7 @@ export default function ClarifyPage() {
   const { state } = useLocation() as { state: NavState | null }
   const query = state?.query ?? ''
   const questions = state?.clarify ?? []
-  const [answers, setAnswers] = useState<Record<string, unknown>>({})
+  const [answers, setAnswers] = useState<Record<string, unknown>>(state?.answers ?? {})
   const [submitting, setSubmitting] = useState(false)
   // 用户自定义补充的竞品（按题 id 存，目前主要用于 competitors 题）
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({})

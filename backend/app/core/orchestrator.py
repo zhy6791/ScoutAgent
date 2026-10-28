@@ -40,6 +40,7 @@ from app.core.models import Evidence, Envelope, make_claim
 from app.core.schemas import coerce_feature_tree, coerce_pricing_model, coerce_user_persona
 from app.core.search import multi_search
 from app.core.sentiment import analyze_sentiment, PLATFORM_LABEL, PLATFORM_SITES
+from app.core.snapshot_store import read_snapshot
 from app.core.textquality import is_relevant_content
 from app.data import expert_by_id, load_experts
 
@@ -111,12 +112,13 @@ def create_task(query: str, mode: str = "deep") -> Dict[str, Any]:
 
 
 def submit_clarify(task_id: str, answers: Dict[str, Any]) -> Dict[str, Any]:
-    # 保留已存的 _mode
+    # 保留系统注入的模式和监控来源等隐藏上下文。
     task = db.get_task(task_id) or {}
     prev = task.get("clarifications", {}) or {}
     merged = {**answers}
-    if "_mode" in prev and "_mode" not in merged:
-        merged["_mode"] = prev["_mode"]
+    for key, value in prev.items():
+        if str(key).startswith("_") and key not in merged:
+            merged[key] = value
     db.update_task_clarify(task_id, merged)
     return {"ok": True}
 
@@ -175,6 +177,34 @@ def refine_section(report_id: str, section_id: str, annotations: List[str]) -> D
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": str(e)}
     return {"ok": False, "message": "refine failed"}
+
+
+def _load_task_seed_evidences(task_id: str) -> List[Evidence]:
+    output: List[Evidence] = []
+    for item in db.list_task_seed_evidences(task_id):
+        evidence = Evidence(
+            evidence_id=item.get("evidence_id", ""),
+            source_url=item.get("source_url", ""),
+            source_type=item.get("source_type", "web"),
+            title=item.get("title", ""),
+            excerpt=item.get("excerpt", ""),
+            captured_at=item.get("captured_at", ""),
+            credibility=float(item.get("credibility") or 0),
+            collected_by=item.get("collected_by", "monitor-agent"),
+            brand=item.get("brand", ""),
+            domain=item.get("domain", ""),
+            snapshot_id=item.get("snapshot_id", ""),
+            change_id=item.get("change_id", ""),
+        )
+        full_text = evidence.excerpt
+        if item.get("snapshot_path"):
+            try:
+                full_text = read_snapshot(item["snapshot_path"])
+            except (OSError, ValueError):
+                pass
+        evidence._full_text = full_text[:6000]  # type: ignore[attr-defined]
+        output.append(evidence)
+    return output
 
 
 def _clarify_questions(query: str) -> List[Dict[str, Any]]:
@@ -679,6 +709,18 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     collect_notes: List[str] = []
     seen_urls: set = set()
 
+    seed_evidences = _load_task_seed_evidences(task_id)
+    if seed_evidences:
+        collect_notes.append(f"本次调研采用 {len(seed_evidences)} 条监控快照作为种子证据，并继续联网交叉核实。")
+        yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
+                              "text": f"已载入 {len(seed_evidences)} 条监控快照证据，继续联网核实变化与竞争影响。",
+                              "ts": _now()})
+        for evidence in seed_evidences:
+            evidences.append(evidence)
+            seen_urls.add(evidence.source_url)
+            ev_by_collector[evidence.collected_by] += 1
+            yield _ev("evidence", evidence.to_dict())
+
     for brand in brands:
         yield _ev("thought", {"id": _sid("th"), "kind": "action", "expert": collector,
                               "text": f"开始深度检索「{brand}」：{'、'.join(angles)}。", "ts": _now()})
@@ -1112,9 +1154,12 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "writing_constraints": write_feedback,
                               "passed_quality_gate": passed_quality_gate,
                               "rework_exhausted": rework_exhausted}
+    if clar.get("_monitor_context"):
+        report["monitor_source"] = clar["_monitor_context"]
     db.save_report(report, task_id=task_id)
     db.save_traces(task_id, report["id"], trace_spans)
     db.mark_task_done(task_id, report["id"])
+    db.link_monitor_report_for_task(task_id, report["id"])
     claims_by_author = Counter(c.get("author", "") for c in claims if c.get("author"))
     db.bump_expert_stats(member_ids, dict(claims_by_author), dict(ev_by_collector))
     if sub_id:

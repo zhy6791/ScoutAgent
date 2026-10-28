@@ -72,6 +72,24 @@ npm run dev                    # http://localhost:3400
 
 > **SQLite 与持久化注意**：Vercel Serverless 文件系统是只读的，运行时仅 `/tmp` 可写且不跨实例持久化。云端部署下数据库不具备本地那样的持久能力，适合演示；生产环境建议替换为托管数据库。
 
+### 竞品订阅监控的部署边界
+
+- 长驻 `backend` 是进程内 Scheduler 的唯一运行位置。首次部署时保持 `SUBSCRIPTION_SCHEDULER_ENABLED=false`，完成手动运行验证后再启用。
+- `api` Serverless 镜像保留相同的数据模型和手动触发接口，但即使配置为 `true`，`subscription_scheduler_active` 也会在 Vercel/AWS Lambda 环境返回 `false`。
+- Serverless 部署如需定时触发，应由外部 Cron 调用受保护的扫描接口；不能依赖实例内常驻线程。
+- 监控时间统一以 UTC 写入 SQLite，订阅时区只用于计算计划和前端展示。
+- 快照默认保存到 `backend/app/data/monitor_snapshots`；可用 `MONITOR_SNAPSHOT_DIR` 覆盖。Serverless 默认路径是 `/tmp/monitor_snapshots`，不具备持久性。
+
+### 监控上线检查
+
+1. 备份 SQLite 数据库和快照目录，启动新版本并确认 Schema 已升级到 v6。
+2. 保持 Scheduler 关闭，通过 `POST /api/subscriptions/{sub_id}/run` 验证一次手动监控。
+3. 查询 `GET /api/monitoring/metrics`，确认抓取成功率、运行终态、LLM 分类失败数和快照占用符合预期。
+4. 只启用内部测试订阅，再设置 `SUBSCRIPTION_SCHEDULER_ENABLED=true` 并重启长驻后端。
+5. 至少观察两个调度周期，确认没有重复领取、有效租约能够阻止并发执行、过期租约能够恢复。
+
+需要停止新任务领取时，将 `SUBSCRIPTION_SCHEDULER_ENABLED=false` 并重启后端。已经取得租约的运行允许完成；异常退出后，租约到期才会重新领取。应用代码回滚时保留 v6 新增表和字段，不执行破坏性降级迁移。
+
 ---
 
 ## 3. `backend/` 与 `api/` 同步约定

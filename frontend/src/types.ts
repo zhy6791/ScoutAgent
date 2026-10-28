@@ -311,6 +311,8 @@ export interface EvidenceRecord {
   collected_by: string
   brand: string
   captured_at: string
+  snapshot_id?: string
+  change_id?: string
 }
 export interface EvidenceFacets {
   total: number
@@ -327,10 +329,133 @@ export interface Subscription {
   sub_id: string
   query: string
   brands: string[]
+  enabled: boolean
+  schedule_type: 'interval' | 'daily'
+  schedule_config: { interval_minutes?: number; time?: string }
+  timezone: string
+  next_run_at: string
+  last_checked_at: string
+  last_success_at: string
+  last_status: string
+  consecutive_failures: number
+  monitor_error: string
+  lease_owner: string
+  lease_expires_at: string
+  updated_at: string
   created_at: string
   last_run_at: string
   last_report_id: string
   run_count: number
+  targets: SubscriptionTarget[]
+  target_count: number
+  enabled_target_count: number
+  latest_run: MonitorRun | null
+  unread_change_count: number
+}
+
+export type MonitorTargetType = 'official' | 'pricing' | 'blog' | 'jobs' | 'custom'
+export type MonitorRunStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed'
+export type ChangeStatus = 'new' | 'read' | 'ignored'
+
+export interface SubscriptionTarget {
+  target_id: string
+  sub_id: string
+  brand: string
+  target_type: MonitorTargetType
+  url: string
+  enabled: boolean
+  last_snapshot_id: string
+  last_hash: string
+  last_checked_at: string
+  failure_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface MonitorRun {
+  run_id: string
+  sub_id: string
+  trigger_type: 'scheduled' | 'manual' | 'retry'
+  scheduled_at: string
+  started_at: string
+  finished_at: string
+  status: MonitorRunStatus
+  target_count: number
+  success_count: number
+  changed_count: number
+  search_calls: number
+  llm_tokens: number
+  duration_ms: number
+  not_modified_count: number
+  minor_change_count: number
+  llm_failure_count: number
+  error: string
+  created_at: string
+}
+
+export interface CompetitorChange {
+  change_id: string
+  sub_id: string
+  run_id: string
+  target_id: string
+  previous_snapshot_id: string
+  current_snapshot_id: string
+  change_type: string
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  material: boolean
+  change_ratio: number
+  diff_summary: string
+  before_excerpt: string
+  after_excerpt: string
+  llm_status: 'success' | 'failed' | 'skipped'
+  status: ChangeStatus
+  research_task_id: string
+  research_report_id: string
+  created_at: string
+  brand: string
+  target_type: MonitorTargetType
+  source_url: string
+}
+
+export interface SubscriptionDraft {
+  query: string
+  brands: string[]
+  timezone: string
+  schedule: {
+    type: 'interval' | 'daily'
+    interval_minutes?: number
+    time?: string
+  }
+  targets: Array<{
+    brand: string
+    target_type: MonitorTargetType
+    url: string
+    enabled?: boolean
+  }>
+  enabled: boolean
+}
+
+export interface TargetCandidate {
+  brand: string
+  target_type: MonitorTargetType
+  url: string
+  title: string
+  snippet: string
+}
+
+export interface MonitorResearchTask extends CreateTaskResp {
+  query: string
+  prefill: Record<string, unknown>
+  monitorContext: {
+    change_id: string
+    snapshot_id: string
+    subscription_id: string
+    brand: string
+    change_type: string
+    severity: string
+    source_url: string
+  }
+  evidenceId: string
 }
 
 /* 专家工作量 */

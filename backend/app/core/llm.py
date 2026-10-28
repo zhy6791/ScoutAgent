@@ -89,6 +89,7 @@ def chat(
     *,
     purpose: str = "",
     evidence_ids: Optional[list] = None,
+    usage_out: Optional[dict] = None,
 ) -> str:
     """一次性返回完整回复文本。遇 429 自动退避重试。
 
@@ -123,6 +124,12 @@ def chat(
                 usage = resp.usage
                 if usage:
                     TOKEN_USAGE["total"] += int(usage.total_tokens or 0)
+                    if usage_out is not None:
+                        usage_out.update({
+                            "prompt_tokens": int(usage.prompt_tokens or 0),
+                            "completion_tokens": int(usage.completion_tokens or 0),
+                            "total_tokens": int(usage.total_tokens or 0),
+                        })
             except Exception:
                 pass
             # 无侵入埋点：记录本次调用的 trace span
@@ -154,10 +161,12 @@ def chat_json(
     model: str | None = None,
     *,
     purpose: str = "",
+    evidence_ids: Optional[list] = None,
+    usage_out: Optional[dict] = None,
 ) -> Optional[Any]:
     """要求 LLM 输出 JSON，解析为对象；失败返回 None（调用方决定是否重试）。"""
     raw = chat(messages, temperature=temperature, max_tokens=max_tokens,
-               model=model, purpose=purpose)
+               model=model, purpose=purpose, evidence_ids=evidence_ids, usage_out=usage_out)
     return _extract_json(raw)
 
 

@@ -9,6 +9,13 @@ import type {
   ReportSection,
   SSEEventType,
   Subscription,
+  SubscriptionDraft,
+  SubscriptionTarget,
+  MonitorRun,
+  CompetitorChange,
+  ChangeStatus,
+  TargetCandidate,
+  MonitorResearchTask,
   TraceSpan,
 } from '../types'
 
@@ -23,6 +30,21 @@ async function safeJson<T>(path: string, init?: RequestInit, fallback?: T): Prom
     if (fallback !== undefined) return fallback
     throw e
   }
+}
+
+async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, init)
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`
+    try {
+      const payload = await response.json() as { detail?: string }
+      if (payload.detail) message = payload.detail
+    } catch {
+      // Keep the HTTP status when the response is not JSON.
+    }
+    throw new Error(message)
+  }
+  return response.json() as Promise<T>
 }
 
 /* 48 专家：优先后端，失败回退本地 JSON（绝不白屏） */
@@ -144,20 +166,123 @@ export async function fetchSubscriptions(): Promise<Subscription[]> {
   return safeJson<Subscription[]>('/api/subscriptions', undefined, [])
 }
 
-export async function createSubscription(query: string, brands: string[]): Promise<Subscription | null> {
-  return safeJson<Subscription | null>(
+export async function createSubscription(input: SubscriptionDraft): Promise<Subscription> {
+  return requestJson<Subscription>(
     '/api/subscriptions',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, brands }),
+      body: JSON.stringify(input),
     },
-    null,
   )
 }
 
 export async function deleteSubscription(subId: string): Promise<{ ok: boolean }> {
-  return safeJson(`/api/subscriptions/${subId}`, { method: 'DELETE' }, { ok: true })
+  return requestJson(`/api/subscriptions/${subId}`, { method: 'DELETE' })
+}
+
+export async function updateSubscription(
+  subId: string,
+  input: Partial<Pick<SubscriptionDraft, 'query' | 'brands' | 'timezone' | 'schedule'>>,
+): Promise<Subscription> {
+  return requestJson(`/api/subscriptions/${subId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export async function pauseSubscription(subId: string): Promise<Subscription> {
+  return requestJson(`/api/subscriptions/${subId}/pause`, { method: 'POST' })
+}
+
+export async function resumeSubscription(subId: string): Promise<Subscription> {
+  return requestJson(`/api/subscriptions/${subId}/resume`, { method: 'POST' })
+}
+
+export async function runSubscription(
+  subId: string,
+): Promise<{ ok: boolean; run_id: string; status: string }> {
+  return requestJson(`/api/subscriptions/${subId}/run`, { method: 'POST' })
+}
+
+export async function fetchSubscriptionTargets(subId: string): Promise<SubscriptionTarget[]> {
+  return requestJson(`/api/subscriptions/${subId}/targets`)
+}
+
+export async function createSubscriptionTarget(
+  subId: string,
+  input: Pick<SubscriptionTarget, 'brand' | 'target_type' | 'url'> & { enabled?: boolean },
+): Promise<SubscriptionTarget> {
+  return requestJson(`/api/subscriptions/${subId}/targets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export async function updateSubscriptionTarget(
+  subId: string,
+  targetId: string,
+  input: Partial<Pick<SubscriptionTarget, 'brand' | 'target_type' | 'url' | 'enabled'>>,
+): Promise<SubscriptionTarget> {
+  return requestJson(`/api/subscriptions/${subId}/targets/${targetId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export async function deleteSubscriptionTarget(
+  subId: string,
+  targetId: string,
+): Promise<{ ok: boolean }> {
+  return requestJson(`/api/subscriptions/${subId}/targets/${targetId}`, { method: 'DELETE' })
+}
+
+export async function fetchMonitorRuns(subId: string): Promise<MonitorRun[]> {
+  return requestJson(`/api/subscriptions/${subId}/runs`)
+}
+
+export async function fetchCompetitorChanges(subId: string): Promise<CompetitorChange[]> {
+  return requestJson(`/api/subscriptions/${subId}/changes`)
+}
+
+export async function updateCompetitorChange(
+  changeId: string,
+  changeStatus: ChangeStatus,
+): Promise<CompetitorChange> {
+  return requestJson(`/api/competitor-changes/${changeId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status: changeStatus }),
+  })
+}
+
+export async function createResearchFromChange(
+  changeId: string,
+  mode: 'quick' | 'deep' | 'expert' = 'deep',
+): Promise<MonitorResearchTask> {
+  return requestJson(`/api/competitor-changes/${changeId}/research`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  })
+}
+
+export async function discoverSubscriptionTargets(
+  query: string,
+  brands: string[],
+): Promise<TargetCandidate[]> {
+  const response = await requestJson<{ items: TargetCandidate[] }>(
+    '/api/subscriptions/targets/discover',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, brands, limit_per_brand: 5 }),
+    },
+  )
+  return response.items
 }
 
 /* 专家工作量看板 */
