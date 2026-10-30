@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     bing_search_key: str = ""
 
     collection_max_concurrency: int = 3
+    # Collect ReAct is opt-in during the rollout; failures fall back to fixed collection.
+    collect_react_enabled: bool = False
+    collect_react_max_rounds: int = 8
+    collect_react_max_search_calls: int = 5
+    collect_react_max_seconds: float = 180.0
+    collect_react_no_progress_rounds: int = 2
 
     douyin_cookie: str = ""
     xhs_cookie: str = ""

@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # 单次搜索超时（秒）
     search_timeout: float = 30.0
     collection_max_concurrency: int = 3
+    collect_react_enabled: bool = False
+    collect_react_max_rounds: int = 8
+    collect_react_max_search_calls: int = 5
+    collect_react_max_seconds: float = 180.0
+    collect_react_no_progress_rounds: int = 2
     # 兼容旧字段（已弃用，不再使用）
     serpapi_key: str = ""
     serpapi_base_url: str = "https://serpapi.com/search"

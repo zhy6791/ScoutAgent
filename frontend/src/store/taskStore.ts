@@ -31,6 +31,16 @@ export interface StreamMessage {
   issues_resolved?: number
   envelope?: { sender?: string; receiver?: string; task_type?: string; payload?: unknown; issues?: unknown[] }
   mode?: string
+  brand?: string
+  action?: string
+  query?: string
+  url?: string
+  status?: string
+  missing?: string[]
+  result?: unknown
+  added_evidence?: number
+  rounds?: number
+  reason?: string
 }
 
 const BASE_NODES: DAGNode[] = [
@@ -168,6 +178,17 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       }
       case 'trace': {
         set({ traces: [...s.traces, d as unknown as TraceSpan] })
+        return
+      }
+      case 'collect_agent_action':
+      case 'collect_tool_call':
+      case 'collect_stop_check':
+      case 'collect_incomplete':
+      case 'post_write_audit':
+      case 'section_rewrite': {
+        // Keep new operational events in the existing activity stream until a
+        // dedicated panel is introduced; this preserves replay visibility.
+        set({ messages: [...s.messages, { id: `event-${Date.now()}`, kind: type, ...d } as StreamMessage] })
         return
       }
       case 'report_ready': {

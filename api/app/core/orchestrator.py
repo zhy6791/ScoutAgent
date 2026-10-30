@@ -29,6 +29,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from app.core import charts as C
 from app.core import db
 from app.core import trace
+from app.core.collect_agent import run_collect_agent
+from app.core.report_audit import report_completeness_audit
 from app.core.audit import (accept_write_constraints, build_rework_envelopes,
                              evaluate_quality, llm_quality_review_with_evidence,
                              partition_rework_envelopes, quality_gate_passed)
@@ -664,6 +666,46 @@ async def _collect_brand_with_limit(
             return brand, None, str(exc)
 
 
+async def _collect_brand_react_with_limit(
+    task_id: str,
+    brand: str,
+    category: str,
+    focus: List[str],
+    angles: List[str],
+    collector: str,
+    fetch_limit: int,
+    freshness: str,
+    existing_urls: set,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, Optional[Dict[str, Any]], str]:
+    """Run the bounded per-brand ReAct collector under the existing semaphore."""
+    async with semaphore:
+        try:
+            trace.set_context(task_id, collector, "collect", f"Collect ReAct：采集「{brand}」")
+            if not _settings.collect_react_enabled:
+                result = await asyncio.to_thread(
+                    _collect_brand, brand, angles, collector, fetch_limit, freshness,
+                    set(existing_urls),
+                )
+                return brand, {**result, "status": "fixed", "actions": []}, ""
+
+            result = await run_collect_agent(
+                task_id, brand, category, focus, angles, collector, fetch_limit, freshness,
+                {_collection_url_key(brand, url[1] if isinstance(url, tuple) else str(url))
+                 for url in existing_urls},
+                fallback=lambda: _collect_brand(
+                    brand, angles, collector, fetch_limit, freshness, set(existing_urls),
+                ),
+                max_rounds=int(_settings.collect_react_max_rounds),
+                max_search_calls=int(_settings.collect_react_max_search_calls),
+                max_seconds=float(_settings.collect_react_max_seconds),
+                no_progress_limit=int(_settings.collect_react_no_progress_rounds),
+            )
+            return brand, result, ""
+        except Exception as exc:
+            return brand, None, str(exc)
+
+
 async def _search_sentiment_platform_with_limit(
     task_id: str,
     brand: str,
@@ -790,6 +832,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     ev_by_collector: Counter = Counter()
     collect_notes: List[str] = []
     seen_urls: set = set()
+    collection_runs: List[Dict[str, Any]] = []
 
     seed_evidences = _load_task_seed_evidences(task_id)
     if seed_evidences:
@@ -811,8 +854,9 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     collection_limit = max(1, int(_settings.collection_max_concurrency))
     collection_semaphore = asyncio.Semaphore(collection_limit)
     collection_tasks = [
-        asyncio.create_task(_collect_brand_with_limit(
-            task_id, brand, angles, collector, cfg["fetch_per_brand"], cfg["freshness"],
+        asyncio.create_task(_collect_brand_react_with_limit(
+            task_id, brand, category, focus, angles, collector,
+            cfg["fetch_per_brand"], cfg["freshness"],
             {key for key in seen_urls if key[0] == str(brand).strip().casefold()}, collection_semaphore,
         ))
         for brand in collection_brands
@@ -822,6 +866,8 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         for e in _drain_trace():
             yield e
         if collection_error:
+            collection_runs.append({"brand": brand, "status": "failed", "reason": collection_error,
+                                    "missing": [], "actions": []})
             collect_notes.append(f"「{brand}」采集异常：{collection_error}")
             trace.record_manual_span(
                 task_id, collector, "collect", f"采集竞品「{brand}」证据",
@@ -835,6 +881,29 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                   "ts": _now()})
             continue
         assert res is not None
+        collection_runs.append({
+            "brand": brand, "status": res.get("status", "fixed"),
+            "reason": res.get("reason", ""), "missing": res.get("missing", []),
+            "rounds": res.get("rounds", 0), "search_calls": res.get("search_calls", 0),
+            "fetch_calls": res.get("fetch_calls", 0), "actions": res.get("actions", []),
+        })
+        for action in res.get("actions", []):
+            yield _ev("collect_agent_action", {
+                "brand": brand, "round": action.get("round"),
+                "action": action.get("action"), "query": action.get("query", ""),
+                "url": action.get("url", ""), "result": action.get("results"),
+                "added_evidence": action.get("added_evidence", 0),
+            })
+            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
+                yield _ev("collect_tool_call", {"brand": brand, **action})
+            if action.get("stop_check"):
+                yield _ev("collect_stop_check", {"brand": brand, **action["stop_check"]})
+        if res.get("status") in {"incomplete", "budget_exhausted", "failed"}:
+            collect_notes.append(f"「{brand}」采集状态为 {res.get('status')}：{res.get('reason', '未达到完整覆盖')}。")
+            yield _ev("collect_incomplete", {
+                "brand": brand, "status": res.get("status"),
+                "missing": res.get("missing", []), "reason": res.get("reason", ""),
+            })
         brand_evidences = [
             ev for ev in res["evidences"]
             if _collection_url_key(ev.brand, ev.source_url) not in seen_urls
@@ -1107,8 +1176,39 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                 extra_angles = angles + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
                 for b in recollect_brands[:3]:
                     trace.set_context(task_id, collector, "collect", f"返工补采「{b}」")
-                    res = await asyncio.to_thread(_collect_brand, b, extra_angles[:cfg["max_angles"]],
-                                                  collector, cfg["fetch_per_brand"], cfg["freshness"], seen_urls)
+                    res = await run_collect_agent(
+                        task_id, b, category, focus, extra_angles[:cfg["max_angles"]], collector,
+                        cfg["fetch_per_brand"], cfg["freshness"],
+                        {_collection_url_key(b, key[1] if isinstance(key, tuple) else str(key))
+                         for key in seen_urls if not isinstance(key, tuple) or key[0] == str(b).strip().casefold()},
+                        fallback=lambda b=b: _collect_brand(
+                            b, extra_angles[:cfg["max_angles"]], collector,
+                            cfg["fetch_per_brand"], cfg["freshness"], seen_urls,
+                        ),
+                        max_rounds=int(_settings.collect_react_max_rounds),
+                        max_search_calls=int(_settings.collect_react_max_search_calls),
+                        max_seconds=float(_settings.collect_react_max_seconds),
+                        no_progress_limit=int(_settings.collect_react_no_progress_rounds),
+                    ) if _settings.collect_react_enabled else await asyncio.to_thread(
+                        _collect_brand, b, extra_angles[:cfg["max_angles"]], collector,
+                        cfg["fetch_per_brand"], cfg["freshness"], seen_urls,
+                    )
+                    collection_runs.append({
+                        "brand": b, "status": res.get("status", "fixed"),
+                        "reason": res.get("reason", ""), "missing": res.get("missing", []),
+                        "rounds": res.get("rounds", 0), "search_calls": res.get("search_calls", 0),
+                        "fetch_calls": res.get("fetch_calls", 0), "actions": res.get("actions", []),
+                        "rework": True,
+                    })
+                    for action in res.get("actions", []):
+                        yield _ev("collect_agent_action", {"brand": b, **action})
+                        if action.get("stop_check"):
+                            yield _ev("collect_stop_check", {"brand": b, **action["stop_check"]})
+                    if res.get("status") in {"incomplete", "budget_exhausted", "failed"}:
+                        yield _ev("collect_incomplete", {
+                            "brand": b, "status": res.get("status"),
+                            "missing": res.get("missing", []), "reason": res.get("reason", ""),
+                        })
                     for e in _drain_trace():
                         yield e
                     for ev in res["evidences"]:
@@ -1273,6 +1373,61 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         for e in _drain_trace():
             yield e
 
+    post_write_audit = report_completeness_audit(
+        sections_text, claims, evidences, brands, section_ids,
+    )
+    post_write_rewrites = 0
+    yield _ev("post_write_audit", {"stage": "initial", **post_write_audit})
+    if not post_write_audit["passed"]:
+        section_fields = {
+            "overview": "overview", "summary": "overview", "feature": "feature_tree",
+            "pricing": "pricing_model", "persona": "user_persona", "trend": "trend",
+            "swot": "swot", "conclusion": "conclusion", "risk": "risk",
+        }
+        claim_by_id = {str(c.get("claim_id", "")): c for c in claims}
+        targeted: Dict[str, List[str]] = {}
+        for issue in post_write_audit["issues"]:
+            sid = str(issue.get("section_id", ""))
+            if sid in section_ids:
+                targeted.setdefault(sid, []).append(issue.get("issue", ""))
+                continue
+            issue_text = str(issue.get("issue", ""))
+            if issue_text.startswith("key claims missing:"):
+                ids = [x.strip() for x in issue_text.split(":", 1)[1].split(",")]
+                for claim_id in ids:
+                    claim = claim_by_id.get(claim_id)
+                    field_name = str((claim or {}).get("field", ""))
+                    candidate = next((sid for sid, field_name_for_section in section_fields.items()
+                                      if field_name_for_section == field_name and sid in section_ids), "summary")
+                    if candidate in section_ids:
+                        targeted.setdefault(candidate, []).append(issue_text)
+            elif issue_text.startswith("brand missing from report:"):
+                candidate = "summary" if "summary" in section_ids else "overview"
+                if candidate in section_ids:
+                    targeted.setdefault(candidate, []).append(issue_text)
+        for sid, feedback_items in targeted.items():
+            title = dict(SECTION_PLAN).get(sid, sid)
+            model = _model("core") if sid in CORE_SECTIONS else _model("aux")
+            feedback = "\n".join(dict.fromkeys(
+                [*feedback_items, "请遵循已提供的 Claim 与 Evidence ID，不得改动证据编号。"]
+            ))
+            yield _ev("section_rewrite", {"section_id": sid, "reason": feedback,
+                                           "attempt": 1, "max_attempts": 1})
+            trace.set_context(task_id, writer, "write", f"成稿审计后重写章节「{title}」")
+            sections_text[sid] = await asyncio.to_thread(
+                _write_single_section, sid, title, query, brands, focus,
+                evidences, claims, analysis, model,
+                cfg["min_paragraphs"], cfg["para_words"], cfg["section_max_tokens"], feedback,
+            )
+            post_write_rewrites += 1
+            for e in _drain_trace():
+                yield e
+        post_write_audit = report_completeness_audit(
+            sections_text, claims, evidences, brands, section_ids,
+        )
+        yield _ev("post_write_audit", {"stage": "after_rewrite", **post_write_audit,
+                                        "rewrites": post_write_rewrites})
+
     chart_specs = _build_charts(brands, analysis, sentiment, claims)
     for ch in chart_specs:
         yield _ev("chart", ch)
@@ -1299,6 +1454,17 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               analysis, metrics, quality_before.to_dict(),
                               quality_after.to_dict(), trace_spans, mode, section_ids,
                               sentiment_text)
+    report["collection_runs"] = collection_runs
+    report["post_write_audit"] = post_write_audit
+    report["post_write_rewrites"] = post_write_rewrites
+    report["post_write_audit_failed"] = not post_write_audit["passed"]
+    statuses = {str(run.get("status", "fixed")) for run in collection_runs}
+    if "failed" in statuses:
+        report["collection_stop_status"] = "failed"
+    elif "incomplete" in statuses or "budget_exhausted" in statuses:
+        report["collection_stop_status"] = "incomplete"
+    else:
+        report["collection_stop_status"] = "complete"
     # before 保留首次复审，after 指向最终一轮复审。
     report["audit_review"] = {"before": review_before, "after": review_after,
                               "rounds": audit_rounds,

@@ -47,6 +47,12 @@ export type SSEEventType =
   | 'image'
   | 'progress'
   | 'trace'
+  | 'collect_agent_action'
+  | 'collect_tool_call'
+  | 'collect_stop_check'
+  | 'collect_incomplete'
+  | 'post_write_audit'
+  | 'section_rewrite'
   | 'report_ready'
   | 'done'
   | 'error'
@@ -208,6 +214,23 @@ export interface Report {
   quality_after?: Record<string, unknown>
   audit_review?: AuditReview
   trace?: TraceSpan[]
+  collection_runs?: CollectionRun[]
+  collection_stop_status?: 'complete' | 'incomplete' | 'failed'
+  post_write_audit?: Record<string, unknown>
+  post_write_rewrites?: number
+  post_write_audit_failed?: boolean
+}
+
+export interface CollectionRun {
+  brand: string
+  status: 'fixed' | 'complete' | 'incomplete' | 'budget_exhausted' | 'failed' | 'fallback'
+  reason?: string
+  missing?: string[]
+  rounds?: number
+  search_calls?: number
+  fetch_calls?: number
+  actions?: Record<string, unknown>[]
+  rework?: boolean
 }
 
 export interface AuditOpinion {
