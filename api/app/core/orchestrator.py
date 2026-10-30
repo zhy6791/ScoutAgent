@@ -24,6 +24,7 @@ import time
 import uuid
 from collections import Counter
 from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.core import charts as C
 from app.core import db
@@ -53,6 +54,24 @@ def _now() -> str:
 
 def _sid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+def _collection_url_key(brand: str, url: str) -> tuple[str, str]:
+    """Return a stable brand/source key for concurrent collection deduplication."""
+    raw = str(url or "").strip()
+    try:
+        parts = urlsplit(raw)
+        query = [
+            (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if not key.lower().startswith(("utm_", "fbclid", "gclid"))
+        ]
+        normalized = urlunsplit((
+            parts.scheme.lower(), parts.netloc.lower(), parts.path or "/",
+            urlencode(sorted(query), doseq=True), "",
+        ))
+    except Exception:
+        normalized = raw
+    return str(brand or "").strip().casefold(), normalized
 
 
 # ── 调研模式三档（对应需求 3）─────────────────────────────
@@ -557,8 +576,9 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
                    existing_urls: set) -> Dict[str, Any]:
     """采集单个品牌：搜索 + 抓取 + 构造 Evidence。返回 {evidences, images, figures_events}。
 
-    纯同步函数，供 asyncio.to_thread 调用；existing_urls 用于跨轮去重。
+    纯同步函数，供 asyncio.to_thread 调用；existing_urls 按规范化 (brand, url) 跨轮去重。
     """
+    existing_urls = set(existing_urls)
     queries = [f"{brand} {a}" for a in angles]
     results = multi_search(queries, num=10, freshness=freshness)
     out_ev: List[Evidence] = []
@@ -568,7 +588,7 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
         if fetched >= fetch_limit:
             break
         url = r.get("url", "")
-        if not url or url in existing_urls:
+        if not url or _collection_url_key(brand, url) in existing_urls:
             continue
         page = fetch_page(url, fallback_snippet=r.get("snippet", ""))
         ok = page.get("ok")
@@ -578,7 +598,7 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
         # 正文二次相关性校验（剔除题不对版）
         if not is_relevant_content(text, [brand], brand):
             continue
-        existing_urls.add(url)
+        existing_urls.add(_collection_url_key(brand, url))
         stype = _source_type(url)
         captured = page.get("captured_at", _now())
         # 用 search 返回的 datePublished（captured_at）做时效性判断更准
@@ -619,6 +639,64 @@ def _collect_brand(brand: str, angles: List[str], collector: str,
             })
         fetched += 1
     return {"evidences": out_ev, "images": out_img, "found": len(results)}
+
+
+async def _collect_brand_with_limit(
+    task_id: str,
+    brand: str,
+    angles: List[str],
+    collector: str,
+    fetch_limit: int,
+    freshness: str,
+    existing_urls: set,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, Optional[Dict[str, Any]], str]:
+    """Collect one brand without sharing mutable URL state across workers."""
+    async with semaphore:
+        try:
+            trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
+            result = await asyncio.to_thread(
+                _collect_brand, brand, angles, collector, fetch_limit, freshness,
+                set(existing_urls),
+            )
+            return brand, result, ""
+        except Exception as exc:
+            return brand, None, str(exc)
+
+
+async def _search_sentiment_platform_with_limit(
+    task_id: str,
+    brand: str,
+    platform: str,
+    site: str,
+    category_query: str,
+    freshness: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, str, List[Dict[str, Any]], str]:
+    """Search one brand/platform sentiment slice under the collection limit."""
+    async with semaphore:
+        try:
+            trace.set_context(task_id, "", "collect", f"采集「{brand}」{platform}舆情")
+            label = PLATFORM_LABEL.get(platform, platform)
+            queries = [
+                f"{brand}{category_query} 评价", f"{brand}{category_query} 怎么样",
+                f"{brand}{category_query} 优缺点", f"{brand}{category_query} 测评",
+            ]
+            results = await asyncio.to_thread(
+                multi_search, queries, num=8, site=site, freshness=freshness,
+            )
+            if not results:
+                fallback = [
+                    f"{brand}{category_query} {label} 评价",
+                    f"{brand}{category_query} {label} 怎么样",
+                    f"{brand}{category_query} {label} 体验",
+                ]
+                results = await asyncio.to_thread(
+                    multi_search, fallback, num=8, freshness=freshness,
+                )
+            return brand, platform, results, ""
+        except Exception as exc:
+            return brand, platform, [], str(exc)
 
 
 # ── 主流程 ───────────────────────────────────────────────
@@ -721,19 +799,49 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "ts": _now()})
         for evidence in seed_evidences:
             evidences.append(evidence)
-            seen_urls.add(evidence.source_url)
+            seen_urls.add(_collection_url_key(evidence.brand, evidence.source_url))
             ev_by_collector[evidence.collected_by] += 1
             yield _ev("evidence", evidence.to_dict())
 
-    for brand in brands:
+    collection_brands = list(dict.fromkeys(brands))
+    for brand in collection_brands:
         yield _ev("thought", {"id": _sid("th"), "kind": "action", "expert": collector,
                               "text": f"开始深度检索「{brand}」：{'、'.join(angles)}。", "ts": _now()})
-        trace.set_context(task_id, collector, "collect", f"采集竞品「{brand}」证据")
-        res = await asyncio.to_thread(_collect_brand, brand, angles, collector,
-                                      cfg["fetch_per_brand"], cfg["freshness"], seen_urls)
+
+    collection_limit = max(1, int(_settings.collection_max_concurrency))
+    collection_semaphore = asyncio.Semaphore(collection_limit)
+    collection_tasks = [
+        asyncio.create_task(_collect_brand_with_limit(
+            task_id, brand, angles, collector, cfg["fetch_per_brand"], cfg["freshness"],
+            {key for key in seen_urls if key[0] == str(brand).strip().casefold()}, collection_semaphore,
+        ))
+        for brand in collection_brands
+    ]
+    for completed in asyncio.as_completed(collection_tasks):
+        brand, res, collection_error = await completed
         for e in _drain_trace():
             yield e
-        if not res["evidences"]:
+        if collection_error:
+            collect_notes.append(f"「{brand}」采集异常：{collection_error}")
+            trace.record_manual_span(
+                task_id, collector, "collect", f"采集竞品「{brand}」证据",
+                detail=f"搜索角度：{'、'.join(angles)}",
+                decision=f"该竞品采集任务失败，其他竞品继续执行：{collection_error}",
+            )
+            for e in _drain_trace():
+                yield e
+            yield _ev("thought", {"id": _sid("th"), "kind": "reflect", "expert": collector,
+                                  "text": f"「{brand}」采集任务失败，已隔离该错误并继续处理其他竞品。",
+                                  "ts": _now()})
+            continue
+        assert res is not None
+        brand_evidences = [
+            ev for ev in res["evidences"]
+            if _collection_url_key(ev.brand, ev.source_url) not in seen_urls
+        ]
+        for ev in brand_evidences:
+            seen_urls.add(_collection_url_key(ev.brand, ev.source_url))
+        if not brand_evidences:
             collect_notes.append(f"「{brand}」未通过搜索获得有效结果（可能限流或不相关），已如实标注。")
             # 记录可观测 span：本次检索动作即便无果也可追溯
             trace.record_manual_span(
@@ -748,9 +856,9 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                                   "ts": _now()})
             continue
         yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": collector,
-                              "text": f"「{brand}」聚合到 {res['found']} 条去重链接，已取证 {len(res['evidences'])} 条。",
+                              "text": f"「{brand}」聚合到 {res['found']} 条去重链接，已取证 {len(brand_evidences)} 条。",
                               "ts": _now()})
-        for ev in res["evidences"]:
+        for ev in brand_evidences:
             evidences.append(ev)
             ev_by_collector[collector] += 1
             d = ev.to_dict()
@@ -765,7 +873,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             images.append(fig)
             yield _ev("image", fig)
         # 可观测 span：把「检索→去重→取证」这步非 LLM 动作写进决策链路（不再空白）
-        brand_evs = [ev for ev in res["evidences"]]
+        brand_evs = brand_evidences
         brand_domains = {domain_of(ev.source_url) for ev in brand_evs}
         brand_domains.discard("")
         trace.record_manual_span(
@@ -793,63 +901,91 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     # 品类关键词（用于消歧 + 相关性过滤，如 Trae→AI编程工具，避免抓到「美甲」等同名内容）
     cat_kw = _category_keywords(category)
     cat_q = (" " + category) if category else ""
-    for sb in sentiment_brands:
-        trace.set_context(task_id, sentiment_expert, "collect", f"采集「{sb}」全平台舆情")
-        plat_counts: Counter = Counter()
-        dropped = 0
-        for plat, site in PLATFORM_SITES.items():
-            plat_label = PLATFORM_LABEL.get(plat, plat)
-            # 多角度口碑检索词，带上品类消歧（覆盖评价/优缺点/吐槽/真实体验）
-            site_q = [f"{sb}{cat_q} 评价", f"{sb}{cat_q} 怎么样",
-                      f"{sb}{cat_q} 优缺点", f"{sb}{cat_q} 测评"]
-            plat_results = await asyncio.to_thread(multi_search, site_q, num=8, site=site,
-                                                   freshness=cfg["freshness"])
-            # 站内受限（如抖音/小红书常被 include 过滤掉）→ 回退：全网检索 + 平台关键词
-            if not plat_results:
-                fb_q = [f"{sb}{cat_q} {plat_label} 评价", f"{sb}{cat_q} {plat_label} 怎么样",
-                        f"{sb}{cat_q} {plat_label} 体验"]
-                plat_results = await asyncio.to_thread(multi_search, fb_q, num=8,
-                                                       freshness=cfg["freshness"])
-            for e in _drain_trace():
-                yield e
-            for r in plat_results[:take]:
-                url = r.get("url", "")
-                title = r.get("title", "")
-                text = (r.get("snippet") or title or "").strip()
-                if not url or not text or url in seen_urls:
-                    continue
-                # 相关性过滤：标题/正文必须命中品牌名或品类关键词，否则丢弃（题不对版）
-                if not _sentiment_relevant(sb, cat_kw, title, text):
-                    dropped += 1
-                    continue
-                seen_urls.add(url)
-                # 平台归属：站内搜索用 plat；回退搜索按真实域名判定，判不出则归到当前平台
-                detected = _source_type(url)
-                plat_final = plat if detected in ("web", "official", "news") else detected
-                sentiment_comments.append({"text": text, "platform": plat_final, "url": url,
-                                           "title": title, "brand": sb})
-                plat_counts[plat_final] += 1
-                pub = r.get("captured_at", "")
-                cred = score_evidence(url, detected, captured_at=pub, has_publish_date=bool(pub),
-                                      ok_fetch=False, excerpt=text[:280],
-                                      signals={"platform": plat_final})
-                ev = Evidence(
-                    evidence_id=_sid("e"), source_url=url, source_type=detected,
-                    title=title or f"{sb} 口碑", excerpt=text[:280],
-                    captured_at=pub or _now(), credibility=cred, collected_by=sentiment_expert,
-                    review_text=text[:4000], brand=sb, domain=domain_of(url),
-                )
-                evidences.append(ev)
-                ev_by_collector[sentiment_expert] += 1
-                d = ev.to_dict()
-                d["domain"] = domain_of(url)
-                d["brand"] = sb
-                d.pop("review_text", None)
-                yield _ev("evidence", {**d})
-        kept = len([c for c in sentiment_comments if c['brand'] == sb])
+    sentiment_jobs = [
+        (sb, plat, site)
+        for sb in sentiment_brands
+        for plat, site in PLATFORM_SITES.items()
+    ]
+    sentiment_semaphore = asyncio.Semaphore(max(1, int(_settings.collection_max_concurrency)))
+    sentiment_tasks = [
+        asyncio.create_task(_search_sentiment_platform_with_limit(
+            task_id, sb, plat, site, cat_q, cfg["freshness"], sentiment_semaphore,
+        ))
+        for sb, plat, site in sentiment_jobs
+    ]
+    sentiment_results: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    sentiment_errors: Dict[tuple[str, str], str] = {}
+    for completed_count, completed in enumerate(asyncio.as_completed(sentiment_tasks), start=1):
+        sb, plat, results, error = await completed
+        sentiment_results[(sb, plat)] = results
+        if error:
+            sentiment_errors[(sb, plat)] = error
+            collect_notes.append(f"「{sb}」{PLATFORM_LABEL.get(plat, plat)}舆情采集异常：{error}")
+        for event in _drain_trace():
+            yield event
+        status = f"失败：{error}" if error else f"检索到 {len(results)} 条候选结果"
         yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": sentiment_expert,
-                              "text": f"「{sb}」舆情有效 {kept} 条（已剔除 {dropped} 条题不对版），"
-                                      f"平台分布：{dict(plat_counts)}。", "ts": _now()})
+                              "text": f"「{sb}」{PLATFORM_LABEL.get(plat, plat)}舆情检索完成：{status}。",
+                              "ts": _now()})
+        yield _ev("progress", prog(50 + int(3 * completed_count / max(len(sentiment_jobs), 1)),
+                                    "collect", len(evidences)))
+
+    # Stable merge order keeps duplicate-source attribution deterministic.
+    for sb, plat, _site in sentiment_jobs:
+        results = sentiment_results.get((sb, plat), [])
+        kept_for_platform: List[Evidence] = []
+        dropped = 0
+        for r in results[:take]:
+            url = r.get("url", "")
+            title = r.get("title", "")
+            text = (r.get("snippet") or title or "").strip()
+            if not url or not text or _collection_url_key(sb, url) in seen_urls:
+                continue
+            if not _sentiment_relevant(sb, cat_kw, title, text):
+                dropped += 1
+                continue
+            seen_urls.add(_collection_url_key(sb, url))
+            detected = _source_type(url)
+            plat_final = plat if detected in ("web", "official", "news") else detected
+            sentiment_comments.append({"text": text, "platform": plat_final, "url": url,
+                                       "title": title, "brand": sb})
+            pub = r.get("captured_at", "")
+            cred = score_evidence(url, detected, captured_at=pub, has_publish_date=bool(pub),
+                                  ok_fetch=False, excerpt=text[:280],
+                                  signals={"platform": plat_final})
+            evidence = Evidence(
+                evidence_id=_sid("e"), source_url=url, source_type=detected,
+                title=title or f"{sb} 口碑", excerpt=text[:280],
+                captured_at=pub or _now(), credibility=cred, collected_by=sentiment_expert,
+                review_text=text[:4000], brand=sb, domain=domain_of(url),
+            )
+            evidences.append(evidence)
+            kept_for_platform.append(evidence)
+            ev_by_collector[sentiment_expert] += 1
+            data = evidence.to_dict()
+            data["domain"] = domain_of(url)
+            data["brand"] = sb
+            data.pop("review_text", None)
+            yield _ev("evidence", data)
+        error = sentiment_errors.get((sb, plat), "")
+        trace.record_manual_span(
+            task_id, sentiment_expert, "collect", f"采集「{sb}」{PLATFORM_LABEL.get(plat, plat)}舆情",
+            detail=f"查询平台：{PLATFORM_LABEL.get(plat, plat)}；候选结果：{len(results)} 条",
+            decision=(f"平台采集异常：{error}" if error else
+                      f"保留 {len(kept_for_platform)} 条有效口碑，剔除 {dropped} 条不相关结果"),
+            evidence_ids=[e.evidence_id for e in kept_for_platform[:8]],
+        )
+        for event in _drain_trace():
+            yield event
+
+    for sb in sentiment_brands:
+        kept = sum(1 for comment in sentiment_comments if comment["brand"] == sb)
+        distribution = Counter(comment["platform"] for comment in sentiment_comments
+                               if comment["brand"] == sb)
+        yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": sentiment_expert,
+                              "text": f"「{sb}」舆情有效 {kept} 条，平台分布：{dict(distribution)}。",
+                              "ts": _now()})
+
     yield _ev("thought", {"id": _sid("th"), "kind": "finding", "expert": sentiment_expert,
                           "text": f"舆情共采集到 {len(sentiment_comments)} 条带真实链接的多平台口碑（覆盖 {len(sentiment_brands)} 个品牌）。",
                           "ts": _now()})

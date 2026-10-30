@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     search_timeout: float = 30.0
     bing_search_key: str = ""
 
+    collection_max_concurrency: int = 3
+
     douyin_cookie: str = ""
     xhs_cookie: str = ""
     bilibili_cookie: str = ""

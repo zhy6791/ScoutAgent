@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     search_provider: str = "bocha"
     # 单次搜索超时（秒）
     search_timeout: float = 30.0
+    collection_max_concurrency: int = 3
     # 兼容旧字段（已弃用，不再使用）
     serpapi_key: str = ""
     serpapi_base_url: str = "https://serpapi.com/search"
