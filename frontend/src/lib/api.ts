@@ -313,6 +313,7 @@ export function openTaskStream(taskId: string, handlers: SSEHandlers): () => voi
     'collect_tool_call',
     'collect_stop_check',
     'collect_incomplete',
+    'evidence_request',
     'post_write_audit',
     'section_rewrite',
     'report_ready',

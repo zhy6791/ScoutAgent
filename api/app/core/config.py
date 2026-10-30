@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # 单次搜索超时（秒）
     search_timeout: float = 30.0
     collection_max_concurrency: int = 3
-    collect_react_enabled: bool = False
+    collect_react_enabled: bool = True
     collect_react_max_rounds: int = 8
     collect_react_max_search_calls: int = 5
     collect_react_max_seconds: float = 180.0

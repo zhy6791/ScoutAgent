@@ -51,6 +51,7 @@ export type SSEEventType =
   | 'collect_tool_call'
   | 'collect_stop_check'
   | 'collect_incomplete'
+  | 'evidence_request'
   | 'post_write_audit'
   | 'section_rewrite'
   | 'report_ready'
@@ -215,7 +216,8 @@ export interface Report {
   audit_review?: AuditReview
   trace?: TraceSpan[]
   collection_runs?: CollectionRun[]
-  collection_stop_status?: 'complete' | 'incomplete' | 'failed'
+  evidence_requests?: Array<{ brand: string; dimension: string; queries: string[]; reason: string }>
+  collection_stop_status?: 'complete' | 'incomplete' | 'budget_exhausted' | 'failed'
   post_write_audit?: Record<string, unknown>
   post_write_rewrites?: number
   post_write_audit_failed?: boolean

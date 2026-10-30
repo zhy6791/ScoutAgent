@@ -677,6 +677,7 @@ async def _collect_brand_react_with_limit(
     freshness: str,
     existing_urls: set,
     semaphore: asyncio.Semaphore,
+    action_queue: Optional[asyncio.Queue] = None,
 ) -> tuple[str, Optional[Dict[str, Any]], str]:
     """Run the bounded per-brand ReAct collector under the existing semaphore."""
     async with semaphore:
@@ -700,6 +701,7 @@ async def _collect_brand_react_with_limit(
                 max_search_calls=int(_settings.collect_react_max_search_calls),
                 max_seconds=float(_settings.collect_react_max_seconds),
                 no_progress_limit=int(_settings.collect_react_no_progress_rounds),
+                on_action=(lambda action: action_queue.put_nowait((brand, action)) if action_queue else None),
             )
             return brand, result, ""
         except Exception as exc:
@@ -833,6 +835,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     collect_notes: List[str] = []
     seen_urls: set = set()
     collection_runs: List[Dict[str, Any]] = []
+    evidence_requests_all: List[Dict[str, Any]] = []
 
     seed_evidences = _load_task_seed_evidences(task_id)
     if seed_evidences:
@@ -853,16 +856,36 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
 
     collection_limit = max(1, int(_settings.collection_max_concurrency))
     collection_semaphore = asyncio.Semaphore(collection_limit)
+    action_queue: asyncio.Queue = asyncio.Queue()
     collection_tasks = [
         asyncio.create_task(_collect_brand_react_with_limit(
             task_id, brand, category, focus, angles, collector,
             cfg["fetch_per_brand"], cfg["freshness"],
             {key for key in seen_urls if key[0] == str(brand).strip().casefold()}, collection_semaphore,
+            action_queue,
         ))
         for brand in collection_brands
     ]
     for completed in asyncio.as_completed(collection_tasks):
-        brand, res, collection_error = await completed
+        completed_task = asyncio.create_task(completed)
+        while not completed_task.done():
+            try:
+                action_brand, action = await asyncio.wait_for(action_queue.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            yield _ev("collect_agent_action", {"brand": action_brand, **action})
+            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
+                yield _ev("collect_tool_call", {"brand": action_brand, **action})
+            if action.get("stop_check"):
+                yield _ev("collect_stop_check", {"brand": action_brand, **action["stop_check"]})
+        brand, res, collection_error = await completed_task
+        while not action_queue.empty():
+            action_brand, action = await action_queue.get()
+            yield _ev("collect_agent_action", {"brand": action_brand, **action})
+            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
+                yield _ev("collect_tool_call", {"brand": action_brand, **action})
+            if action.get("stop_check"):
+                yield _ev("collect_stop_check", {"brand": action_brand, **action["stop_check"]})
         for e in _drain_trace():
             yield e
         if collection_error:
@@ -887,17 +910,6 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
             "rounds": res.get("rounds", 0), "search_calls": res.get("search_calls", 0),
             "fetch_calls": res.get("fetch_calls", 0), "actions": res.get("actions", []),
         })
-        for action in res.get("actions", []):
-            yield _ev("collect_agent_action", {
-                "brand": brand, "round": action.get("round"),
-                "action": action.get("action"), "query": action.get("query", ""),
-                "url": action.get("url", ""), "result": action.get("results"),
-                "added_evidence": action.get("added_evidence", 0),
-            })
-            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
-                yield _ev("collect_tool_call", {"brand": brand, **action})
-            if action.get("stop_check"):
-                yield _ev("collect_stop_check", {"brand": brand, **action["stop_check"]})
         if res.get("status") in {"incomplete", "budget_exhausted", "failed"}:
             collect_notes.append(f"「{brand}」采集状态为 {res.get('status')}：{res.get('reason', '未达到完整覆盖')}。")
             yield _ev("collect_incomplete", {
@@ -1112,6 +1124,26 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
     review_before = await asyncio.to_thread(
         llm_quality_review_with_evidence, query, brands, focus, claims, structured, quality_before,
         _model("aux"), evidences=evidences)
+    evidence_requests = analysis.get("evidence_requests", [])
+    if evidence_requests:
+        evidence_requests_all.extend(evidence_requests)
+        for request in evidence_requests:
+            yield _ev("evidence_request", request)
+        request_routes = [
+            {"category": "collect",
+             "issue": f"{item['brand']} 缺少「{item['dimension']}」证据：{item.get('reason') or '当前证据不足'}",
+             "suggestion": "；".join(item.get("queries", [])),
+             "brand": item["brand"]}
+            for item in evidence_requests
+        ]
+        review_before = dict(review_before)
+        review_before["verdict"] = "rework"
+        review_before["evidence_requests"] = evidence_requests
+        review_before["issue_routes"] = [
+            *request_routes,
+            *(review_before.get("issue_routes") or []),
+        ][:12]
+        review_before["issues"] = [route["issue"] for route in review_before["issue_routes"]]
     for e in _drain_trace():
         yield e
     yield _ev("message", {"id": _sid("m"), "kind": "audit_review", "expert": auditor,
@@ -1126,6 +1158,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                           "review_validation_errors": review_before.get("review_validation_errors", []),
                           "rule_issues": quality_before.to_dict().get("rule_issues", []),
                           "issue_routes": review_before.get("issue_routes", []),
+                          "evidence_requests": evidence_requests,
                           "claim_evidence_reviews": review_before.get("claim_evidence_reviews", []),
                           "review_context_stats": review_before.get("review_context_stats", {})})
     current_quality = quality_before
@@ -1173,10 +1206,17 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                 feedback_angles = ["第三方评测", "独立来源", "用户口碑", "市场数据"]
                 if any(word in collect_feedback for word in ("舆情", "声量", "情感")):
                     feedback_angles.extend(["社区讨论", "用户评价"])
-                extra_angles = angles + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
+                request_queries = [
+                    query_text.strip()
+                    for value in env.payload.get("feedback", [])
+                    for query_text in str(value).replace("；", "\n").splitlines()
+                    if query_text.strip() and len(query_text.strip()) < 181
+                ]
+                extra_angles = angles + request_queries + feedback_angles + ["最新进展2026", "官方公告", "行业报告"]
                 for b in recollect_brands[:3]:
                     trace.set_context(task_id, collector, "collect", f"返工补采「{b}」")
-                    res = await run_collect_agent(
+                    action_queue = asyncio.Queue()
+                    recollect_task = asyncio.create_task(run_collect_agent(
                         task_id, b, category, focus, extra_angles[:cfg["max_angles"]], collector,
                         cfg["fetch_per_brand"], cfg["freshness"],
                         {_collection_url_key(b, key[1] if isinstance(key, tuple) else str(key))
@@ -1189,10 +1229,33 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                         max_search_calls=int(_settings.collect_react_max_search_calls),
                         max_seconds=float(_settings.collect_react_max_seconds),
                         no_progress_limit=int(_settings.collect_react_no_progress_rounds),
-                    ) if _settings.collect_react_enabled else await asyncio.to_thread(
-                        _collect_brand, b, extra_angles[:cfg["max_angles"]], collector,
-                        cfg["fetch_per_brand"], cfg["freshness"], seen_urls,
-                    )
+                        guidance=collect_feedback,
+                        on_action=lambda action: action_queue.put_nowait(action),
+                    )) if _settings.collect_react_enabled else None
+                    if recollect_task is not None:
+                        while not recollect_task.done():
+                            try:
+                                action = await asyncio.wait_for(action_queue.get(), timeout=0.25)
+                            except asyncio.TimeoutError:
+                                continue
+                            yield _ev("collect_agent_action", {"brand": b, **action})
+                            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
+                                yield _ev("collect_tool_call", {"brand": b, **action})
+                            if action.get("stop_check"):
+                                yield _ev("collect_stop_check", {"brand": b, **action["stop_check"]})
+                        res = await recollect_task
+                        while not action_queue.empty():
+                            action = await action_queue.get()
+                            yield _ev("collect_agent_action", {"brand": b, **action})
+                            if action.get("action") in {"search_web", "search_platform", "fetch_webpage"}:
+                                yield _ev("collect_tool_call", {"brand": b, **action})
+                            if action.get("stop_check"):
+                                yield _ev("collect_stop_check", {"brand": b, **action["stop_check"]})
+                    else:
+                        res = await asyncio.to_thread(
+                            _collect_brand, b, extra_angles[:cfg["max_angles"]], collector,
+                            cfg["fetch_per_brand"], cfg["freshness"], seen_urls,
+                        )
                     collection_runs.append({
                         "brand": b, "status": res.get("status", "fixed"),
                         "reason": res.get("reason", ""), "missing": res.get("missing", []),
@@ -1200,10 +1263,6 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                         "fetch_calls": res.get("fetch_calls", 0), "actions": res.get("actions", []),
                         "rework": True,
                     })
-                    for action in res.get("actions", []):
-                        yield _ev("collect_agent_action", {"brand": b, **action})
-                        if action.get("stop_check"):
-                            yield _ev("collect_stop_check", {"brand": b, **action["stop_check"]})
                     if res.get("status") in {"incomplete", "budget_exhausted", "failed"}:
                         yield _ev("collect_incomplete", {
                             "brand": b, "status": res.get("status"),
@@ -1265,6 +1324,22 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
         current_review = await asyncio.to_thread(
             llm_quality_review_with_evidence, query, brands, focus, claims, structured, current_quality,
             _model("aux"), evidences=evidences)
+        round_requests = analysis.get("evidence_requests", [])
+        if round_requests:
+            evidence_requests_all.extend(round_requests)
+            request_routes = [
+                {"category": "collect",
+                 "issue": f"{item['brand']} 缺少「{item['dimension']}」证据：{item.get('reason') or '当前证据不足'}",
+                 "suggestion": "；".join(item.get("queries", [])), "brand": item["brand"]}
+                for item in round_requests
+            ]
+            current_review = dict(current_review)
+            current_review["verdict"] = "rework"
+            current_review["evidence_requests"] = round_requests
+            current_review["issue_routes"] = [*request_routes, *(current_review.get("issue_routes") or [])][:12]
+            current_review["issues"] = [route["issue"] for route in current_review["issue_routes"]]
+            for request in round_requests:
+                yield _ev("evidence_request", request)
         for e in _drain_trace():
             yield e
         audit_rounds.append({"round": rework_rounds_done, "quality": current_quality.to_dict(),
@@ -1282,6 +1357,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               "review_validation_errors": current_review.get("review_validation_errors", []),
                               "rule_issues": current_quality.to_dict().get("rule_issues", []),
                               "issue_routes": current_review.get("issue_routes", []),
+                              "evidence_requests": round_requests,
                               "claim_evidence_reviews": current_review.get("claim_evidence_reviews", []),
                               "review_context_stats": current_review.get("review_context_stats", {}),
                               "passed_quality_gate": quality_gate_passed(current_quality, current_review)})
@@ -1455,6 +1531,7 @@ async def run_pipeline(task_id: str, sub_id: str = "") -> AsyncIterator[Dict[str
                               quality_after.to_dict(), trace_spans, mode, section_ids,
                               sentiment_text)
     report["collection_runs"] = collection_runs
+    report["evidence_requests"] = evidence_requests_all
     report["post_write_audit"] = post_write_audit
     report["post_write_rewrites"] = post_write_rewrites
     report["post_write_audit_failed"] = not post_write_audit["passed"]
@@ -1622,7 +1699,9 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
         "market_share": [],
         "five_forces": {},
         "trends": {},
+        "evidence_requests": [],
     }
+    data: Dict[str, Any] = {}
     try:
         data = chat_json(
             [
@@ -1638,9 +1717,11 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
                     '"pricing":[{"brand":"竞品","entry_price":数字或null,"note":"定价模式与策略解读"}],'
                     '"market_share":[{"name":"竞品","value":百分比整数}],'
                     '"five_forces":{"rivalry":0-100,"new_entrants":0-100,"substitutes":0-100,"buyer_power":0-100,"supplier_power":0-100,"note":"波特五力总体研判一句话"},'
-                    '"trends":{"x":["时间点,如2021/2022/H1等"],"unit":"指标单位,如 版本数/月活(百万)/营收增速(%)","series":[{"name":"竞品","values":[数字,与x等长]}],"note":"趋势研判一句话"}}。'
+                    '"trends":{"x":["时间点,如2021/2022/H1等"],"unit":"指标单位,如 版本数/月活(百万)/营收增速(%)","series":[{"name":"竞品","values":[数字,与x等长]}],"note":"趋势研判一句话"},'
+                    '"evidence_requests":[{"brand":"竞品","dimension":"缺失维度","queries":["建议查询词"],"reason":"缺口原因"}]}。'
                     "five_forces 用 0-100 量化各方向竞争压力（越高压力越大），基于证据合理研判。"
                     "trends 给出可比的时间序列（产品迭代节奏/用户规模/营收增速等任一可由证据支撑的维度），无依据则留空对象 {}，不要编造。"
+                    "只有现有证据无法支撑重要结论时才返回 evidence_requests；否则返回空数组。每个请求必须使用调研品牌和明确维度，queries 给出 1-3 个可执行搜索词。"
                     "comparison/pricing/market_share 必须基于证据合理推断，无依据则留空数组或 null。"
                     "【数据真实性铁律】所有评分/数值必须精确、可信、有区分度：严禁清一色用 5 或 10 的整数倍（如 80/85/90），"
                     "要给出精确到个位的真实评分（如 83、77、91、68），不同竞品、不同维度的分数要有真实差异，体现你基于证据的细腻判断；"
@@ -1684,10 +1765,31 @@ def _analyze(query, brands, focus, evidences: List[Evidence], members: List[str]
                     "market_share": share,
                     "five_forces": ff,
                     "trends": tr,
+                    "evidence_requests": _normalize_evidence_requests(data.get("evidence_requests"), brands, focus),
                 }
     except Exception:
         pass
+    fallback["evidence_requests"] = _normalize_evidence_requests(data.get("evidence_requests"), brands, focus)
     return fallback
+
+
+def _normalize_evidence_requests(raw: Any, brands: List[str], focus: List[str]) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    normalized = []
+    valid_brands = {brand.casefold(): brand for brand in brands}
+    for item in raw[:8]:
+        if not isinstance(item, dict):
+            continue
+        brand = valid_brands.get(str(item.get("brand") or "").strip().casefold())
+        dimension = str(item.get("dimension") or "").strip()[:120]
+        queries = item.get("queries")
+        queries = [str(query).strip()[:180] for query in queries if str(query).strip()] if isinstance(queries, list) else []
+        if not brand or not dimension or (focus and dimension.casefold() not in {x.casefold() for x in focus} and len(dimension) < 3):
+            continue
+        normalized.append({"brand": brand, "dimension": dimension, "queries": queries[:3],
+                           "reason": str(item.get("reason") or "").strip()[:300]})
+    return normalized
 
 
 def _analyze_structured(query, brands, focus, evidences: List[Evidence],

@@ -24,7 +24,6 @@ export interface StreamMessage {
   text?: string
   members?: string[]
   claim?: Claim
-  reason?: string
   diff?: { before: string; after: string }
   metrics_before?: Record<string, number>
   metrics_after?: Record<string, number>
@@ -40,6 +39,10 @@ export interface StreamMessage {
   result?: unknown
   added_evidence?: number
   rounds?: number
+  dimension?: string
+  queries?: string[]
+  decision_ms?: number
+  tool_ms?: number
   reason?: string
 }
 
@@ -184,6 +187,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       case 'collect_tool_call':
       case 'collect_stop_check':
       case 'collect_incomplete':
+      case 'evidence_request':
       case 'post_write_audit':
       case 'section_rewrite': {
         // Keep new operational events in the existing activity stream until a

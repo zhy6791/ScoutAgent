@@ -25,13 +25,14 @@ class CollectAgentTests(unittest.IsolatedAsyncioTestCase):
             "snippet": "Acme Pricing details", "captured_at": "2026-10-30",
         }]
         page = {"ok": True, "text": "Acme pricing plan and price details", "images": []}
+        observed_actions = []
         with patch("app.core.collect_agent.chat_json", side_effect=actions), \
                 patch("app.core.collect_agent.multi_search", return_value=search_result), \
                 patch("app.core.collect_agent.fetch_page", return_value=page), \
                 patch("app.core.collect_agent.is_relevant_content", return_value=True):
             result = await run_collect_agent(
                 "task_1", "Acme", "software", ["pricing"], ["pricing"], "L1-001",
-                4, "oneYear", set(), max_rounds=5,
+                4, "oneYear", set(), max_rounds=5, on_action=observed_actions.append,
             )
 
         self.assertEqual(result["status"], "complete")
@@ -39,6 +40,10 @@ class CollectAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidences"][0].brand, "Acme")
         self.assertEqual(result["search_calls"], 1)
         self.assertEqual(result["fetch_calls"], 1)
+        self.assertEqual([item["action"] for item in observed_actions], [
+            "search_web", "fetch_webpage", "finish_collection",
+        ])
+        self.assertTrue(all("decision_ms" in item for item in observed_actions))
 
     async def test_finish_with_missing_dimension_continues_until_budget(self):
         with patch("app.core.collect_agent.chat_json", return_value={"action": "finish_collection"}):

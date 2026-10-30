@@ -210,6 +210,14 @@ def _action_prompt(state: CollectState, observation: str) -> List[Dict[str, str]
     ]
 
 
+def _notify_action(callback: Optional[Callable[[Dict[str, Any]], None]], action: Dict[str, Any]) -> None:
+    if callback is not None:
+        try:
+            callback(dict(action))
+        except Exception:
+            pass
+
+
 async def run_collect_agent(
     task_id: str,
     brand: str,
@@ -226,32 +234,40 @@ async def run_collect_agent(
     max_search_calls: int = 5,
     max_seconds: float = 180.0,
     no_progress_limit: int = 2,
+    guidance: str = "",
+    on_action: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run one bounded ReAct loop. Tool failures are observations, not crashes."""
     state = CollectState(brand=brand, category=category, focus=list(focus), angles=list(angles))
     state.seen_urls = set(existing_urls)
     max_fetch_calls = max(1, int(fetch_limit))
-    observation = "Start by searching the most important missing dimension."
+    observation = guidance or "Start by searching the most important missing dimension."
     model = get_settings().zhipu_model_aux
     try:
         while state.round_index < max_rounds:
             state.round_index += 1
             before = len(state.evidences)
             before_candidates = len(state.candidates)
+            decision_started = time.monotonic()
             response = await asyncio.to_thread(
                 chat_json, _action_prompt(state, observation),
                 temperature=0.2, max_tokens=900, model=model,
                 purpose="collect_react_action",
                 evidence_ids=[e.evidence_id for e in state.evidences[-8:]],
             )
+            decision_ms = int((time.monotonic() - decision_started) * 1000)
             action = response if isinstance(response, dict) else {}
             kind = str(action.get("action") or action.get("type") or "").strip().lower()
             if kind not in {"search_web", "search_platform", "fetch_webpage", "finish_collection"}:
                 observation = "Invalid action. Return one allowed action as JSON."
-                state.actions.append({"round": state.round_index, "action": "invalid", "result": observation})
+                invalid_action = {"round": state.round_index, "action": "invalid", "result": observation,
+                                  "decision_ms": decision_ms}
+                state.actions.append(invalid_action)
+                _notify_action(on_action, invalid_action)
                 state.no_progress_rounds += 1
                 continue
-            record: Dict[str, Any] = {"round": state.round_index, "action": kind}
+            record: Dict[str, Any] = {"round": state.round_index, "action": kind,
+                                      "decision_ms": decision_ms}
             if kind in {"search_web", "search_platform"}:
                 query = str(action.get("query") or "").strip()
                 if not query:
@@ -261,9 +277,11 @@ async def run_collect_agent(
                     observation = "搜索预算已用尽，请请求 finish_collection。"
                 else:
                     state.search_calls += 1
+                    tool_started = time.monotonic()
                     results = await asyncio.to_thread(
                         multi_search, [query], num=10, site=site or None, freshness=freshness,
                     )
+                    record["tool_ms"] = int((time.monotonic() - tool_started) * 1000)
                     new_candidates = 0
                     for result in results:
                         url = str(result.get("url") or "").strip()
@@ -283,7 +301,9 @@ async def run_collect_agent(
                     observation = "This URL was already used; choose a different candidate."
                 else:
                     state.fetch_calls += 1
+                    tool_started = time.monotonic()
                     page = await asyncio.to_thread(fetch_page, url, fallback_snippet=result.get("snippet", ""))
+                    record["tool_ms"] = int((time.monotonic() - tool_started) * 1000)
                     evidence = _make_evidence(brand, collector, result, page)
                     if evidence is None:
                         observation = "The page was empty or not relevant to this brand; choose another candidate."
@@ -309,6 +329,7 @@ async def run_collect_agent(
                 )
                 record["stop_check"] = gate
                 state.actions.append(record)
+                _notify_action(on_action, record)
                 if gate["status"] in {"complete", "incomplete", "budget_exhausted"}:
                     return {"brand": brand, "evidences": state.evidences, "images": state.images,
                             "found": len(state.candidates), "status": gate["status"],
@@ -317,6 +338,7 @@ async def run_collect_agent(
                             "fetch_calls": state.fetch_calls, "rounds": state.round_index}
                 observation = "Cannot finish yet: " + ", ".join(gate["missing"] or [gate["reason"]])
             state.actions.append(record)
+            _notify_action(on_action, record)
             made_progress = len(state.evidences) > before or len(state.candidates) > before_candidates
             state.no_progress_rounds = 0 if made_progress else state.no_progress_rounds + 1
             if state.no_progress_rounds >= no_progress_limit:

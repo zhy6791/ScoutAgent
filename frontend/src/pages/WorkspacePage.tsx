@@ -44,6 +44,9 @@ export default function WorkspacePage() {
   const byId = useExpertStore((s) => s.byId)
 
   const reworkMsg = messages.find((m) => m.kind === 'rework')
+  const collectionEvents = messages
+    .filter((m) => ['collect_agent_action', 'collect_tool_call', 'collect_stop_check', 'collect_incomplete', 'evidence_request'].includes(m.kind))
+    .slice(-8)
 
   // 报告就绪后短暂停留再跳转
   useEffect(() => {
@@ -194,6 +197,29 @@ export default function WorkspacePage() {
 
         {/* 右：实时证据流 + 图片 */}
         <aside className="flex min-h-0 flex-col border-l border-line bg-card/40">
+          <div className="shrink-0 border-b border-line px-5 py-3">
+            <div className="mb-2 flex items-center gap-1.5 text-aux font-semibold text-ink">
+              <Activity size={15} className="text-primary" /> 采集 Agent 动态
+            </div>
+            <div className="max-h-44 space-y-2 overflow-y-auto">
+              {collectionEvents.length === 0 ? (
+                <p className="text-tag text-ink-3">等待采集决策</p>
+              ) : collectionEvents.map((event) => (
+                <div key={event.id} className="border-l-2 border-primary/40 pl-2 text-tag text-ink-2">
+                  <div className="font-medium text-ink">
+                    {event.brand || '调研对象'} · {event.kind === 'evidence_request' ? '请求补采' : event.action || event.kind}
+                  </div>
+                  {event.dimension && <div>维度：{event.dimension}</div>}
+                  {event.query && <div className="break-words">查询：{event.query}</div>}
+                  {event.url && <div className="break-all">页面：{event.url}</div>}
+                  {event.reason && <div>{event.reason}</div>}
+                  {(event.decision_ms !== undefined || event.tool_ms !== undefined) && (
+                    <div className="text-ink-3">决策 {event.decision_ms ?? 0} ms · 工具 {event.tool_ms ?? 0} ms</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
           <div className="flex items-center gap-1.5 border-b border-line px-5 py-3 text-aux font-semibold text-ink">
             <FileText size={15} className="text-primary" /> 证据库（{evidences.length}）
           </div>
